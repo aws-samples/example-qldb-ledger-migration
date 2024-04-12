@@ -1,4 +1,4 @@
-# amazon-qldb-migrate
+# example-qldb-ledger-migration
 
 This project demonstrates a data migration from Amazon Quantum Ledger Database (QLDB) to Amazon Aurora PostgreSQL using the vehicle registration (DMV) ledger from the  [tutorial](https://docs.aws.amazon.com/qldb/latest/developerguide/getting-started.html) in the [Amazon QLDB Developer Guide](https://docs.aws.amazon.com/qldb/latest/developerguide/what-is.html) as an example.
 
