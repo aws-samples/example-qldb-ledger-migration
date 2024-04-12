@@ -1,0 +1,776 @@
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Sets up QLDB ledger streaming and a Lambda function to send events from the the stream into an Aurora PostgreSQL
+  database.
+
+
+Parameters:
+  LedgerName:
+    Description: "The name of the vehicle registration ledger to migrate"
+    Type: "String"
+    Default: "vehicle-registration"
+
+  LedgerStreamStartTime:
+    Description: "Inclusive start time for the vehicle registration ledger"
+    Type: "String"
+
+  LastFullLoadBlock:
+    Description: "The sequence number of the last block migrated to the target database via the full table load"
+    Type: "Number"
+
+  KinesisShardCount:
+    Description: "The number of shards in the Kinesis stream"
+    Type: "Number"
+    Default: "1"
+
+  AuroraClusterArn:
+    Description: "The ARN of the target Aurora PostgreSQL cluster to migrate data into"
+    Type: "String"
+
+  AuroraDatabaseName:
+    Description: "The name of the Aurora database on the cluster to migrate data into"
+    Type: "String"
+
+  DatabaseUserSecretArn:
+    Description: "The ARN of the Secret containing the credentials to the Aurora cluster"
+    Type: "String"
+
+
+Resources:
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+
+  EmptyS3BucketFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "EmptyS3BucketFunctionRights"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketVersions"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  EmptyS3BucketFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Deletes all objects and object versions from an S3 bucket"
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !GetAtt EmptyS3BucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          import boto3
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+          
+          s3_client = boto3.client('s3')
+          
+          
+          def handler(event, context):
+              respond_to_cfn = not ('test' in event or (__name__ == "__main__"))
+              response_data = {}
+          
+              if 'RequestType' not in event or event['RequestType'] != 'Delete':
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  return
+          
+              try:
+                  #
+                  # Validate inputs
+                  #
+                  if 'ResourceProperties' not in event:
+                      logger.error("Invalid event:  event does not contain 'ResourceProperties'")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  parameters = event['ResourceProperties']
+                  if 'Bucket' not in parameters or len(parameters['Bucket']) < 1:
+                      logger.error("Bucket parameter not provided")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  #
+                  # Do stuff
+                  #
+                  paginator = s3_client.get_paginator('list_object_versions')
+                  iterator = paginator.paginate(Bucket=parameters['Bucket'])
+                  for page in iterator:
+                      if 'Versions' not in page:
+                          continue
+          
+                      obj_list = []
+                      for version in page['Versions']:
+                          obj_list.append({'Key': version['Key'], 'VersionId': version['VersionId']})
+          
+                      kill_object = {'Quiet': False, 'Objects': obj_list}
+                      s3_client.delete_objects(Bucket=parameters['Bucket'], Delete=kill_object)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+          
+                  return response_data
+              except:
+                  logger.exception(event)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+  EmptyLambdaCodeBucket:
+    Type: Custom::EmptyLambdaCodeBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketFunction.Arn
+      Bucket: !Ref LambdaCodeBucket
+
+  LayerCodeBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "MigrationLayerCodeBuilderS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LayerCodeBuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Builds the code dependencies for the Lambda layer used by functions in this migration project"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt LayerCodeBuilderRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref LambdaCodeBucket
+          S3_KEY_PREFIX: 'dms-code/'
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import sys
+          import shutil
+          import subprocess            
+          import zipfile
+          
+          from datetime import datetime
+          
+          target_bucket = os.environ['S3_BUCKET']
+
+          def upload_file_to_s3(file_path, bucket, key):
+              s3 = boto3.client('s3')
+              s3.upload_file(file_path, bucket, key)
+              print(f"Upload successful. {file_path} uploaded to {bucket}/{key}")
+
+          def make_zip_filename():
+            now = datetime.now()
+            timestamp = now.strftime('%Y%m%d_%H%M%S')
+            filename = f'PyLedgerExportLayers_{timestamp}.zip'
+            return filename
+
+          def zipdir(path, zipname):
+            zipf = zipfile.ZipFile(zipname, 'w', zipfile.ZIP_DEFLATED)
+            for root, dirs, files in os.walk(path):
+                for file in files:
+                    zipf.write(os.path.join(root, file),
+                              os.path.relpath(os.path.join(root, file), 
+                                              os.path.join(path, '..')))
+            zipf.close()
+  
+          def handler(event, context):              
+            try:
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+                
+              layers = ['psycopg', 'amazon.ion', 'aws_kinesis_agg']
+              os.chdir('/tmp')
+              
+              # clear temp modules path, recreate modules path
+              if os.path.exists("python"):
+                shutil.rmtree("python")
+              os.mkdir("python")
+
+              for layer in layers:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", layer, "-t", "python", "--upgrade"])
+                
+              target_zip_file = make_zip_filename()
+              zipdir('python', target_zip_file)
+
+              zipkey = ''
+              if 'S3_KEY_PREFIX' in os.environ:
+                zipkey = os.environ['S3_KEY_PREFIX']            
+                if zipkey == '/':
+                  zipkey = ''
+                elif len(zipkey) > 0 and not zipkey.endswith('/'):
+                  zipkey = zipkey + '/'
+          
+              zipkey = zipkey + target_zip_file
+          
+              upload_file_to_s3(target_zip_file, target_bucket, zipkey)
+              responseData = {'Bucket': target_bucket, 'Key': zipkey}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)            
+
+  BuildLayerCode:
+    Type: Custom::BuildLambdaLayerCode
+    Properties:
+      ServiceToken: !GetAtt LayerCodeBuilderFunction.Arn
+
+  LambdaLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      LayerName: LedgerExportLayer
+      Content:
+        S3Bucket: !GetAtt BuildLayerCode.Bucket
+        S3Key: !GetAtt BuildLayerCode.Key
+      CompatibleRuntimes:
+        - python3.11
+
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: DmvLedgerStream
+      ShardCount: !Ref KinesisShardCount
+
+  QldbServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: "QldbDmvStreamAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - 'kinesis:PutRecord*'
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:ListShards'
+                Resource:
+                  - !GetAtt KinesisStream.Arn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "qldb.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LedgerStream:
+    Type: AWS::QLDB::Stream
+    Properties:
+      StreamName: DmvMigrationStream
+      LedgerName: !Ref LedgerName
+      InclusiveStartTime: !Ref LedgerStreamStartTime
+      RoleArn: !GetAtt QldbServiceRole.Arn
+      KinesisConfiguration:
+        AggregationEnabled: True
+        StreamArn: !GetAtt KinesisStream.Arn
+
+  LedgerStreamConsumerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'LedgerStreamConsumerAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:ListShards'
+                  - 'kinesis:Get*'
+                  - 'kinesis:DescribeStreamSummary'
+                Resource:
+                  - !GetAtt KinesisStream.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'kinesis:ListStreams'
+                Resource:
+                  - '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'rds-data:BatchExecuteStatement'
+                  - 'rds-data:BeginTransaction'
+                  - 'rds-data:CommitTransaction'
+                  - 'rds-data:ExecuteStatement'
+                  - 'rds-data:RollbackTransaction'
+                Resource:
+                  - !Ref AuroraClusterArn
+              - Effect: 'Allow'
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref DatabaseUserSecretArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+
+  StreamConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Consumes events from a QLDB stream and writes them to a PostgreSQL database"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt LedgerStreamConsumerFunctionRole.Arn
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !Ref AuroraClusterArn
+          DB_NAME: !Ref AuroraDatabaseName
+          SECRET_ARN: !Ref DatabaseUserSecretArn
+          LAST_LOADED_BLOCK: !Ref LastFullLoadBlock
+      Code:
+        ZipFile: |
+          import amazon.ion.simpleion as ion
+          import base64
+          import boto3
+          import json
+          import logging
+          import os
+          
+          from aws_kinesis_agg.deaggregator import deaggregate_records
+          
+          rds_data = boto3.client('rds-data')
+          
+          database_arn = os.environ['DB_CLUSTER_ARN']
+          database_name = os.environ['DB_NAME']
+          credentials_arn = os.environ['SECRET_ARN']
+          last_loaded_block = int(os.environ['LAST_LOADED_BLOCK'])
+          
+          
+          #
+          # Functions to convert table data
+          #
+          def convert_person(sql_parameters, revision):
+              data = revision['data']
+              metadata = revision['metadata']
+          
+              dob = data.get('DOB', None)
+              if dob != None:
+                  dob = dob.strftime("%Y-%m-%d")
+          
+              sql_parameters.append(make_parameter('person_id', metadata['id'], 'stringValue'))
+              sql_parameters.append(make_parameter('first_name', data.get('FirstName', None), 'stringValue'))
+              sql_parameters.append(make_parameter('last_name', data.get('LastName', None), 'stringValue'))
+              sql_parameters.append(make_parameter('dob', dob, 'stringValue', 'DATE'))
+              sql_parameters.append(make_parameter('gov_id', data.get('GovId', None), 'stringValue'))
+              sql_parameters.append(make_parameter('gov_id_type', data.get('GovIdType', None), 'stringValue'))
+              sql_parameters.append(make_parameter('address', data.get('Address', None), 'stringValue'))
+          
+          
+          def convert_vehicle(sql_parameters, revision):
+              data = revision['data']
+          
+              sql_parameters.append(make_parameter('vin', data.get('VIN', None), 'stringValue'))
+              sql_parameters.append(make_parameter('type', data.get('Type', None), 'stringValue'))
+              sql_parameters.append(make_parameter('year', data.get('Year', None), 'longValue'))
+              sql_parameters.append(make_parameter('make', data.get('Make', None), 'stringValue'))
+              sql_parameters.append(make_parameter('model', data.get('Model', None), 'stringValue'))
+              sql_parameters.append(make_parameter('color', data.get('Color', None), 'stringValue'))
+          
+          
+          def convert_vehicle_registration(sql_parameters, revision):
+              data = revision['data']
+          
+              from_dt = data.get('ValidFromDate', None)
+              if from_dt != None:
+                  from_dt = from_dt.strftime("%Y-%m-%d")
+          
+              to_dt = data.get('ValidToDate', None)
+              if to_dt != None:
+                  to_dt = to_dt.strftime("%Y-%m-%d")
+          
+              primary_owner = None
+              secondary_owners = None
+          
+              if 'Owners' in data:
+                  owners = data['Owners']
+                  if 'PrimaryOwner' in owners:
+                      primary_owner = owners['PrimaryOwner'].get('PersonId', None)
+          
+                  if 'SecondaryOwners' in owners and len(owners['SecondaryOwners']) > 0:
+                      arr = []
+                      for secown in owners['SecondaryOwners']:
+                          if 'PersonId' in secown:
+                              arr.append(secown['PersonId'])
+          
+                      if len(arr) > 0:
+                          secondary_owners = ','.join(arr)
+          
+              sql_parameters.append(make_parameter('vin', data.get('VIN', None), 'stringValue'))
+              sql_parameters.append(make_parameter('license_plate_num', data.get('LicensePlateNumber', None), 'stringValue'))
+              sql_parameters.append(make_parameter('state', data.get('State', None), 'stringValue'))
+              sql_parameters.append(make_parameter('city', data.get('City', None), 'stringValue'))
+              sql_parameters.append(make_parameter('valid_from_dt', from_dt, 'stringValue', 'DATE'))
+              sql_parameters.append(make_parameter('valid_to_dt', to_dt, 'stringValue', 'DATE'))
+              sql_parameters.append(
+                  make_parameter('pending_penalty_amt', str(data.get('PendingPenaltyTicketAmount', None)), 'stringValue',
+                                 'DECIMAL'))
+              sql_parameters.append(make_parameter('primary_owner', primary_owner, 'stringValue'))
+              sql_parameters.append(make_parameter('secondary_owners', secondary_owners, 'stringValue'))
+          
+          
+          def convert_drivers_license(sql_parameters, revision):
+              data = revision['data']
+          
+              from_dt = data.get('ValidFromDate', None)
+              if from_dt != None:
+                  from_dt = from_dt.strftime("%Y-%m-%d")
+          
+              to_dt = data.get('ValidToDate', None)
+              if to_dt != None:
+                  to_dt = to_dt.strftime("%Y-%m-%d")
+          
+              sql_parameters.append(make_parameter('person_id', data.get('PersonId', None), 'stringValue'))
+              sql_parameters.append(make_parameter('license_plate_num', data.get('LicensePlateNumber', None), 'stringValue'))
+              sql_parameters.append(make_parameter('license_type', data.get('LicenseType', None), 'stringValue'))
+              sql_parameters.append(make_parameter('valid_from_dt', from_dt, 'stringValue', 'DATE'))
+              sql_parameters.append(make_parameter('valid_to_dt', to_dt, 'stringValue', 'DATE'))
+          
+          
+          table_converters = {
+              'Person': {
+                  'name': 'dmv.person',
+                  'func': convert_person,
+                  'columns': ['doc_id', 'version', 'person_id', 'first_name', 'last_name', 'dob', 'gov_id', 'gov_id_type',
+                              'address', 'ql_audit']
+          
+              },
+              'Vehicle': {
+                  'name': 'dmv.vehicle',
+                  'func': convert_vehicle,
+                  'columns': ['doc_id', 'version', 'vin', 'type', 'year', 'make', 'model', 'color', 'ql_audit']
+              },
+              'VehicleRegistration': {
+                  'name': 'dmv.vehicle_registration',
+                  'func': convert_vehicle_registration,
+                  'columns': ['doc_id', 'version', 'vin', 'license_plate_num', 'state', 'city', 'pending_penalty_amt',
+                              'valid_from_dt', 'valid_to_dt', 'primary_owner', 'secondary_owners', 'ql_audit']
+              },
+              'DriversLicense': {
+                  'name': 'dmv.drivers_license',
+                  'func': convert_drivers_license,
+                  'columns': ['doc_id', 'version', 'person_id', 'license_plate_num', 'license_type', 'valid_from_dt',
+                              'valid_to_dt', 'ql_audit']
+              }
+          }
+          
+          #
+          # Prep the SQL statements for each of the tables (and their audit tables) that 
+          # we are coded to handle.
+          #
+          for converter in table_converters:
+              columns = table_converters[converter]['columns'].copy()
+              table_name = table_converters[converter]['name']
+              statements = {}
+          
+              column_params = columns.copy()
+              update_cols = columns.copy()
+          
+              for idx in range(len(columns)):
+                  column_params[idx] = ':' + column_params[idx]
+                  update_cols[idx] = update_cols[idx] + '=:' + update_cols[idx]
+          
+              column_str = ', '.join(columns)
+              param_str = ', '.join(column_params)
+              update_str = ', '.join(update_cols)
+          
+              statements['select'] = 'select version from {} where doc_id=:doc_id for update'.format(table_name)
+              statements['insert'] = 'insert into {} ({}) values ({})'.format(table_name, column_str, param_str)
+              statements['delete'] = 'delete from {} where doc_id = :doc_id'.format(table_name)
+              statements['update'] = 'update {} set {} where doc_id = :doc_id and version < :version'.format(table_name,
+                                                                                                             update_str)
+          
+              table_name = table_name + '_audit_log'
+              statements['select_audit'] = 'select version from {} where doc_id=:doc_id and version=:version for update'.format(
+                  table_name)
+          
+              columns.append('operation')
+              columns.append('transaction_id')
+          
+              column_params = columns.copy()
+              for idx in range(len(column_params)):
+                  column_params[idx] = ':' + column_params[idx]
+          
+              column_str = ', '.join(columns)
+              param_str = ', '.join(column_params)
+          
+              statements['insert_audit'] = 'insert into {} ({}) values ({})'.format(table_name, column_str, param_str)
+              statements[
+                  'insert_deletion_audit'] = 'insert into {} (doc_id, version, ql_audit, operation, transaction_id) values (:doc_id, :version, :ql_audit, :operation, :transaction_id)'.format(
+                  table_name)
+          
+              table_converters[converter]['sql'] = statements
+          
+          
+          #
+          # Creates a SqlParameter object from the given values for use in the
+          # RDS Data API.
+          #
+          # See https://docs.aws.amazon.com/rdsdataservice/latest/APIReference/API_SqlParameter.html
+          #
+          def make_parameter(name, value, datatype, hint=None):
+              if value == None:
+                  datatype = 'isNull'
+                  value = True
+          
+              parameter = {
+                  'name': name,
+                  'value': {
+                      datatype: value
+                  }
+              }
+          
+              if hint:
+                  parameter['typeHint'] = hint
+          
+              return parameter
+          
+          
+          def process_payload(payload):
+              # payload is the actual ion binary record published by QLDB to the stream
+              ion_record = ion.loads(payload)
+          
+              if 'recordType' not in ion_record or ion_record['recordType'] != 'REVISION_DETAILS':
+                  return
+          
+              if 'payload' not in ion_record:
+                  return
+          
+              revision = ion_record['payload']['revision']
+              if 'metadata' not in revision:
+                  return
+          
+              table_info = ion_record['payload']['tableInfo']
+              ledger_table = table_info['tableName']
+              if ledger_table not in table_converters:
+                  return
+          
+              metadata = revision['metadata']
+              blockAddress = revision['blockAddress']
+          
+              if blockAddress['sequenceNo'] <= last_loaded_block:
+                  return
+          
+              # Convert the transaction timestamp to a format DMS understands
+              txTime = metadata['txTime'].strftime("%Y-%m-%d %H:%M:%S.%f")
+          
+              operation = 'U'
+              if metadata['version'] == 0:
+                  operation = 'I'
+          
+              is_redacted = False
+              sql_parameters = []
+          
+              audit = {
+                  'ql_id': metadata['id'],
+                  'ql_v': metadata['version'],
+                  'ql_txid': metadata['txId'],
+                  'ql_txtime': txTime,
+                  'ql_blockseq': blockAddress['sequenceNo'],
+                  'ql_strand': blockAddress['strandId'],
+                  'ql_rev_hash': str(base64.b64encode(revision['hash']), 'UTF-8'),
+                  'ql_tableid': table_info['tableId'],
+                  'ql_tablename': ledger_table,
+                  'ql_deletion': False,
+                  'ql_redacted': False,
+                  'ql_data_hash': ''
+              }
+          
+              if 'data' in revision:
+                  table_converters[ledger_table]['func'](sql_parameters, revision)
+              else:
+                  if 'dataHash' in revision:
+                      is_redacted = True
+                      audit['ql_redacted'] = True
+                      audit['ql_data_hash'] = revision['dataHash']
+                  else:
+                      audit['ql_deletion'] = True
+                      operation = 'D'
+          
+              # Process main table
+              sql_parameters.append(make_parameter('doc_id', metadata['id'], 'stringValue'))
+              sql_parameters.append(make_parameter('version', metadata['version'], 'longValue'))
+              sql_parameters.append(make_parameter('ql_audit', json.dumps(audit), 'stringValue', 'JSON'))
+          
+              try:
+                  pg_tx = rds_data.begin_transaction(resourceArn=database_arn, secretArn=credentials_arn,
+                                                     database=database_name)
+          
+                  select_resp = rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                           database=database_name,
+                                                           sql=table_converters[ledger_table]['sql']['select'],
+                                                           parameters=sql_parameters, transactionId=pg_tx['transactionId'])
+          
+                  if operation == 'I':
+                      if len(select_resp['records']) == 0:
+                          rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                     database=database_name, sql=table_converters[ledger_table]['sql']['insert'],
+                                                     parameters=sql_parameters, transactionId=pg_tx['transactionId'])
+                  elif operation == 'U':
+                      if len(select_resp['records']) == 0:
+                          rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                     database=database_name, sql=table_converters[ledger_table]['sql']['insert'],
+                                                     parameters=sql_parameters, transactionId=pg_tx['transactionId'])
+                      else:
+                          pg_version = select_resp['records'][0][0]['longValue']
+                          if metadata['version'] > pg_version:
+                              rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                         database=database_name,
+                                                         sql=table_converters[ledger_table]['sql']['update'],
+                                                         parameters=sql_parameters, transactionId=pg_tx['transactionId'])
+                  elif operation == 'D':
+                      if len(select_resp['records']) > 0:
+                          rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                     database=database_name, sql=table_converters[ledger_table]['sql']['delete'],
+                                                     parameters=sql_parameters, transactionId=pg_tx['transactionId'])
+                  #
+                  # Now process the audit table
+                  #
+                  sql_parameters.append(make_parameter('operation', operation, 'stringValue'))
+                  sql_parameters.append(make_parameter('transaction_id', metadata['txId'], 'stringValue'))
+          
+                  select_resp = rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                           database=database_name,
+                                                           sql=table_converters[ledger_table]['sql']['select_audit'],
+                                                           parameters=sql_parameters, transactionId=pg_tx['transactionId'])
+          
+                  if len(select_resp['records']) == 0:
+                      sql_name = 'insert_audit'
+                      if operation == 'D':
+                          sql_name = 'insert_deletion_audit'
+          
+                      rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                                 database=database_name, transactionId=pg_tx['transactionId'],
+                                                 sql=table_converters[ledger_table]['sql'][sql_name],
+                                                 parameters=sql_parameters)
+          
+                  rds_data.commit_transaction(resourceArn=database_arn, secretArn=credentials_arn,
+                                              transactionId=pg_tx['transactionId'])
+              except Exception as e:
+                  try:
+                      rds_data.rollback_transaction(resourceArn=database_arn, secretArn=credentials_arn,
+                                                    transactionId=pg_tx['transactionId'])
+                  except:
+                      pass
+          
+                  raise e
+          
+          
+          def handler(event, context):
+              raw_kinesis_records = event['Records']
+          
+              # Deaggregate all records in one call
+              records = deaggregate_records(raw_kinesis_records)
+          
+              batch_item_failures = []
+          
+              # Iterate through deaggregated records
+              for record in records:
+          
+                  if 'kinesis' not in record:
+                      continue
+          
+                  curRecordSequenceNumber = record["kinesis"]["sequenceNumber"]
+          
+                  try:
+                      # Kinesis data in Python Lambdas is base64 encoded
+                      payload = base64.b64decode(record['kinesis']['data'])
+                      process_payload(payload)
+                  except Exception as e:
+                      # Return failed record's sequence number
+                      batch_item_failures.append({"itemIdentifier": curRecordSequenceNumber})
+                      logging.getLogger().exception('Error processing kinesis record')
+          
+              return {"batchItemFailures": batch_item_failures}
+
+  LambdaKinesisMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt KinesisStream.Arn
+      BisectBatchOnFunctionError: True
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      FunctionName: !Ref StreamConsumerFunction
+      StartingPosition: TRIM_HORIZON

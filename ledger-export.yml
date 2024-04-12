@@ -1,0 +1,645 @@
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates a step function to export a QLDB ledger into S3.  The ledger export is split across multiple export jobs
+  running concurrently.  Ledger digests and proof hashes are collected for each of the export jobs and written to
+  S3 alongside the exported ledger blocks.
+
+
+Resources:
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ledger-code-${AWS::AccountId}'
+
+  ExportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'ledger-export-${AWS::AccountId}'
+
+  EmptyS3BucketFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "CFNTools-EmptyS3BucketFunctionRights"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketVersions"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  EmptyS3BucketFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Deletes all objects and object versions from an S3 bucket"
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !GetAtt EmptyS3BucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          import boto3
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+          
+          s3_client = boto3.client('s3')
+          
+          
+          def handler(event, context):
+              respond_to_cfn = not ('test' in event or (__name__ == "__main__"))
+              response_data = {}
+          
+              if 'RequestType' not in event or event['RequestType'] != 'Delete':
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  return
+          
+              try:
+                  #
+                  # Validate inputs
+                  #
+                  if 'ResourceProperties' not in event:
+                      logger.error("Invalid event:  event does not contain 'ResourceProperties'")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  parameters = event['ResourceProperties']
+                  if 'Bucket' not in parameters or len(parameters['Bucket']) < 1:
+                      logger.error("Bucket parameter not provided")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  #
+                  # Do stuff
+                  #
+                  paginator = s3_client.get_paginator('list_object_versions')
+                  iterator = paginator.paginate(Bucket=parameters['Bucket'])
+                  for page in iterator:
+                      if 'Versions' not in page:
+                          continue
+          
+                      obj_list = []
+                      for version in page['Versions']:
+                          obj_list.append({'Key': version['Key'], 'VersionId': version['VersionId']})
+          
+                      kill_object = {'Quiet': False, 'Objects': obj_list}
+                      s3_client.delete_objects(Bucket=parameters['Bucket'], Delete=kill_object)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+          
+                  return response_data
+              except:
+                  logger.exception(event)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+  EmptyLambdaCodeBucket:
+    Type: Custom::EmptyLambdaCodeBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketFunction.Arn
+      Bucket: !Ref LambdaCodeBucket
+
+  LayerCodeBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "LayerCodeBuilderS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LayerCodeBuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Builds the code dependencies for the Lambda layer used by functions in this project"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt LayerCodeBuilderRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref LambdaCodeBucket
+          S3_KEY_PREFIX: 'export-code/'
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import sys
+          import shutil
+          import subprocess            
+          import zipfile
+          
+          from datetime import datetime
+          
+          target_bucket = os.environ['S3_BUCKET']
+
+          def upload_file_to_s3(file_path, bucket, key):
+              s3 = boto3.client('s3')
+              s3.upload_file(file_path, bucket, key)
+              print(f"Upload successful. {file_path} uploaded to {bucket}/{key}")
+
+          def make_zip_filename():
+            now = datetime.now()
+            timestamp = now.strftime('%Y%m%d_%H%M%S')
+            filename = f'PyLedgerExportLayers_{timestamp}.zip'
+            return filename
+
+          def zipdir(path, zipname):
+            zipf = zipfile.ZipFile(zipname, 'w', zipfile.ZIP_DEFLATED)
+            for root, dirs, files in os.walk(path):
+                for file in files:
+                    zipf.write(os.path.join(root, file),
+                              os.path.relpath(os.path.join(root, file), 
+                                              os.path.join(path, '..')))
+            zipf.close()
+  
+          def handler(event, context):              
+            try:
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+                
+              layers = ['amazon.ion']
+              os.chdir('/tmp')
+              
+              # clear temp modules path, recreate modules path
+              if os.path.exists("python"):
+                shutil.rmtree("python")
+              os.mkdir("python")
+
+              for layer in layers:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", layer, "-t", "python", "--upgrade"])
+                
+              target_zip_file = make_zip_filename()
+              zipdir('python', target_zip_file)
+
+              zipkey = ''
+              if 'S3_KEY_PREFIX' in os.environ:
+                zipkey = os.environ['S3_KEY_PREFIX']         
+                if zipkey == '/':
+                  zipkey = ''
+                elif len(zipkey) > 0 and not zipkey.endswith('/'):
+                  zipkey = zipkey + '/'
+          
+              zipkey = zipkey + target_zip_file
+          
+              upload_file_to_s3(target_zip_file, target_bucket, zipkey)
+              responseData = {'Bucket': target_bucket, 'Key': zipkey}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)            
+
+  # Invokes the function to build the zip file of dependencies that our Lambda layer will use
+  BuildLayerCode:
+    Type: Custom::BuildLambdaLayerCode
+    Properties:
+      ServiceToken: !GetAtt LayerCodeBuilderFunction.Arn
+
+  LambdaLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      LayerName: LedgerExportLayer
+      Content:
+        S3Bucket: !GetAtt BuildLayerCode.Bucket
+        S3Key: !GetAtt BuildLayerCode.Key
+      CompatibleRuntimes:
+        - python3.11
+
+  #
+  # Export processing functions
+  #
+  QLDBServiceExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: "QLDBServiceExportPermissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObjectAcl"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt ExportBucket.Arn
+                  - !Sub '${ExportBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "qldb.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:*'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ExporterFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "ExporterFunctionAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "qldb:GetDigest"
+                  - "qldb:GetBlock"
+                  - "qldb:ExportJournalToS3"
+                  - "qldb:DescribeJournalS3Export"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObjectAcl"
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                Resource:
+                  - !GetAtt ExportBucket.Arn
+                  - !Sub '${ExportBucket.Arn}/*'
+              - Effect: "Allow"
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !GetAtt QLDBServiceExportRole.Arn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ExporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Creates parallel ledger export jobs"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt ExporterFunctionRole.Arn
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ExportBucket
+          ROLE_ARN: !GetAtt QLDBServiceExportRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          from amazon.ion import simpleion
+          from amazon.ion.core import IonType
+          from amazon.ion.simple_types import IonPyInt
+          
+          def handler(event, context):
+            ledger_name = event['LedgerName']
+            export_count = event['ExportCount']
+            if export_count < 1:
+              export_count = 1
+          
+            role_arn = os.environ['ROLE_ARN']
+        
+            s3Config = {
+              'Bucket': os.environ['S3_BUCKET'],
+              'Prefix': event['BucketPrefix'],
+              'EncryptionConfiguration': {
+                'ObjectEncryptionType': 'SSE_S3'
+              }
+            }
+        
+            qldb = boto3.client('qldb')
+            digest_result = qldb.get_digest(Name=ledger_name)
+            address_ion = simpleion.loads(digest_result['DigestTipAddress']['IonText'])
+            
+            block_cnt = int(address_ion['sequenceNo'] / export_count)
+            
+            start_time = datetime.datetime(1900, 1, 1)
+            export_ids = []
+            for i in range(0, export_count):
+              if i == (export_count - 1):
+                  end_time = datetime.datetime.utcnow().replace(microsecond=0)
+              else:
+                  address_ion['sequenceNo'] = IonPyInt.from_value(IonType.INT, block_cnt * (i + 1))
+                  address_str = simpleion.dumps(address_ion, binary=False, omit_version_marker=True)
+                  block_response = qldb.get_block(Name=ledger_name, BlockAddress={'IonText': address_str})
+                  block = simpleion.loads(block_response['Block']['IonText'])
+                  end_time = block['blockTimestamp'].replace(microsecond=0, tzinfo=None)
+          
+              export_response = qldb.export_journal_to_s3(Name=ledger_name, OutputFormat='JSON', InclusiveStartTime=start_time,
+                                                          ExclusiveEndTime=end_time, RoleArn=role_arn, S3ExportConfiguration=s3Config)
+        
+              export_ids.append(export_response['ExportId'])
+              start_time = end_time
+        
+            return {'Ledger': ledger_name, 'Prefix': event['BucketPrefix'], 'ExportIds': export_ids}
+
+  ExportStatusCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Checks the status of the parallel exports"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt ExporterFunctionRole.Arn
+      Layers:
+        - !Ref LambdaLayer
+      Code:
+        ZipFile: |
+          import boto3
+          
+          qldb = boto3.client('qldb')
+          
+          def handler(event, context):
+              print(event)
+              if 'Statuses' not in event:
+                  event['Statuses'] = ['IN_PROGRESS' for i in range(len(event['ExportIds']))]
+          
+              for i in range(len(event['ExportIds'])):
+                  if event['Statuses'][i] == 'IN_PROGRESS':
+                      response = qldb.describe_journal_s3_export(Name=event['Ledger'], ExportId=event['ExportIds'][i])
+          
+                      if response['ExportDescription']['Status'] == 'CANCELLED':
+                          msg = 'Export ' + event['ExportIds'][i] + ' has been cancelled'
+                          print(msg)
+                          raise Exception(msg)
+          
+                      event['Statuses'][i] = response['ExportDescription']['Status']
+          
+              completed = True
+              for status in event['Statuses']:
+                  if status != 'COMPLETED':
+                      completed = False
+                      break
+          
+              event['Done'] = completed
+              return event
+
+  DigestAndProofsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Grabs the ledger digest and proof hashes for the last exported block"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 600
+      Role: !GetAtt ExporterFunctionRole.Arn
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ExportBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from amazon.ion import simpleion
+          from amazon.ion.core import IonType
+          from amazon.ion.simple_types import IonPyDict
+          from amazon.ion.simple_types import IonPyInt
+          from base64 import b64encode
+          
+          qldb = boto3.client('qldb')
+          s3 = boto3.client('s3')
+          
+          def handler(event, context):
+              bucket = os.environ['S3_BUCKET']
+          
+              digest_result = qldb.get_digest(Name=event['Ledger'])
+              address_ion = simpleion.loads(digest_result['DigestTipAddress']['IonText'])
+          
+              last_export = {}
+              
+              for export_id in event['ExportIds']:
+                  # Determine the last block exported from the last export's completed manifest file
+                  manifest_key = event['Prefix']
+                  manifest_key = manifest_key + export_id + '.' + address_ion['strandId'] + '.completed.manifest'
+              
+                  manifest = s3.get_object(Bucket=bucket, Key=manifest_key)
+                  ion = simpleion.loads(manifest['Body'].read())
+                  if len(ion['keys']) == 0:
+                    continue
+          
+                  last_key = ion['keys'][-1]
+                  del ion
+                  del manifest
+              
+                  last_dot = last_key.rfind('.')
+                  last_dash = last_key.rfind('-')
+                  last_block_num = int(last_key[last_dash + 1:last_dot])
+              
+                  block_address_ion = IonPyDict({})
+                  block_address_ion['strandId'] = address_ion['strandId']
+                  block_address_ion['sequenceNo'] = IonPyInt.from_value(IonType.INT, last_block_num)
+                  block_address_ionstr = simpleion.dumps(block_address_ion, binary=False, omit_version_marker=True)
+              
+                  # Now get the proof hashes for the last exported block
+                  block_response = qldb.get_block(Name=event['Ledger'], BlockAddress={'IonText': block_address_ionstr},
+                                                  DigestTipAddress={'IonText': digest_result['DigestTipAddress']['IonText']})
+              
+                  # Now store the digest and proof hashes to S3 for export verifications after the ledger is deleted
+                  proofs = []
+                  for proof in simpleion.loads(block_response['Proof']['IonText']):
+                      proofs.append(str(b64encode(proof), 'UTF-8'))
+          
+                  block = simpleion.loads(block_response['Block']['IonText'])
+              
+                  output = {
+                      'Ledger': event['Ledger'],
+                      'Digest': str(b64encode(digest_result['Digest']), 'UTF-8'),
+                      'DigestTipAddress': {
+                          'strandId': str(address_ion['strandId']),
+                          'sequenceNo': int(address_ion['sequenceNo'])
+                      },
+                      'Export': export_id,
+                      'LastBlockNum': last_block_num,
+                      'LastBlockTimestamp': block['blockTimestamp'].strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                      'Proof': proofs
+                  }
+              
+                  s3.put_object(Bucket=bucket, Key=manifest_key + export_id + '.' + address_ion['strandId'] + '.proofs.json',
+                                Body=json.dumps(output))
+          
+                  last_export = output
+          
+              return last_export
+
+  StepFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "SplitterStepFunctionLambdaAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt ExporterFunction.Arn
+                  - !GetAtt ExportStatusCheckFunction.Arn
+                  - !GetAtt DigestAndProofsFunction.Arn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action:
+              - "sts:AssumeRole"
+
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: LedgerExporter
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString:
+        !Sub
+        - |
+          {
+            "Comment": "Executes a parallel QLDB ledger export and grabs a digest and proof hashes for the last block exported",
+            "StartAt": "Export",
+            "States": {
+              "Export": {
+                "Type": "Task",
+                "Resource": "${exportFunctionArn}",
+                "InputPath": "$",
+                "Next": "Sleep"
+              },
+              "Sleep": {
+                "Type": "Wait",
+                "Seconds": 60,
+                "Next": "CheckExportStatus"
+              },
+              "CheckExportStatus": {
+                "Type": "Task",
+                "Resource": "${statusCheckFunctionArn}",
+                "Next": "SleepOrNot"
+              },
+              "SleepOrNot": {
+                "Type": "Choice",
+                "Default": "Sleep",
+                "Choices": [
+                  {
+                    "Variable": "$.Done",
+                    "BooleanEquals": true,
+                    "Next": "Digest"
+                  }
+                ]
+              },
+              "Digest": {
+                "Type": "Task",
+                "Resource": "${digestProofsFunctionArn}",
+                "End": true
+              }
+            }
+          }
+        - {
+            exportFunctionArn: !GetAtt ExporterFunction.Arn,
+            statusCheckFunctionArn: !GetAtt ExportStatusCheckFunction.Arn,
+            digestProofsFunctionArn: !GetAtt DigestAndProofsFunction.Arn
+          }
+
+
+Outputs:
+  ExportBucketName:
+    Description: 'The name of the S3 bucket that contains the exported QLDB ledger files'
+    Value: !Ref ExportBucket
+
+  ExportBucketArn:
+    Description: 'The ARN of the S3 bucket that contains the exported QLDB ledger files'
+    Value: !GetAtt ExportBucket.Arn
+
+  LambdaCodeBucketName:
+    Description: 'The name of the S3 bucket that contains code dependencies for Lambda functions'
+    Value: !Ref LambdaCodeBucket
+
+  LambdaCodeBucketArn:
+    Description: 'The ARN of the S3 bucket that contains code dependencies for Lambda functions'
+    Value: !GetAtt LambdaCodeBucket.Arn
+
+  LambdaCodeS3Key:
+    Description: 'The S3 key of the Lambda code dependencies ZIP file'
+    Value:  !GetAtt BuildLayerCode.Key

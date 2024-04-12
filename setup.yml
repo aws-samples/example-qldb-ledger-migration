@@ -1,0 +1,1422 @@
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates the DMV ledger, target Aurora PostgreSQL database, related VPC networking, and other required
+  components for the example solution.  Customers using the ledger migration solution will most likely have
+  an existing QLDB ledger, target database, etc. and will not need to deploy this slack but will need information
+  about their environment for subsequent steps in the migration process.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Networking'
+        Parameters:
+          - VPCName
+          - VPCCIDR
+          - PublicSubnetCIDRs
+          - DatabaseSubnetCIDRs
+      - Label:
+          default: 'QLDB Source Ledger'
+        Parameters:
+          - LedgerName
+      - Label:
+          default: 'Aurora Postgres Target Database'
+        Parameters:
+          - AuroraDatabaseName
+          - AuroraDBInstanceClass
+
+Parameters:
+  VPCName:
+    Description: "Name of the VPC"
+    Type: "String"
+    Default: "dmv-migrate"
+
+  VPCCIDR:
+      Description: "CIDR block for the VPC"
+      Type: "String"
+      AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}(\\/([0-9]|[1-2][0-9]|3[0-2]))?$"
+      Default: "10.10.0.0/16"
+
+  PublicSubnetCIDRs:
+    Description: "CIDR blocks for public sub-networks.  This should be a comma-delimited list of three CIDRs."
+    Type: "CommaDelimitedList"
+    Default: "10.10.1.0/24, 10.10.11.0/24, 10.10.21.0/24"
+
+  DatabaseSubnetCIDRs:
+    Description: "CIDR blocks for database sub-networks.  This should be a comma-delimited list of three CIDRs."
+    Type: "CommaDelimitedList"
+    Default: "10.10.2.0/24, 10.10.12.0/24, 10.10.22.0/24"
+
+  LedgerName:
+    Description: "The name of the DMV QLDB ledger"
+    Type: "String"
+    Default: "vehicle-registration"
+
+  AuroraDBInstanceClass:
+    Description: "Instance class for the Aurora target database instance(s)"
+    Type: "String"
+    Default: "db.r7g.large"
+
+  AuroraDatabaseName:
+    Description: "The name of the database to create in the Aurora cluster"
+    Type: "String"
+    Default: "ledger"
+
+
+Resources:
+
+  ########################################################################################
+  # Template support resources
+  ########################################################################################
+
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ledger-setup-${AWS::AccountId}'
+
+  EmptyS3BucketFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "CFNTools-EmptyS3BucketFunctionRights"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketVersions"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  EmptyS3BucketFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Deletes all objects and object versions from an S3 bucket"
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !GetAtt EmptyS3BucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          import boto3
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+          
+          s3_client = boto3.client('s3')
+          
+          
+          def handler(event, context):
+              respond_to_cfn = not ('test' in event or (__name__ == "__main__"))
+              response_data = {}
+          
+              if 'RequestType' not in event or event['RequestType'] != 'Delete':
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  return
+          
+              try:
+                  #
+                  # Validate inputs
+                  #
+                  if 'ResourceProperties' not in event:
+                      logger.error("Invalid event:  event does not contain 'ResourceProperties'")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  parameters = event['ResourceProperties']
+                  if 'Bucket' not in parameters or len(parameters['Bucket']) < 1:
+                      logger.error("Bucket parameter not provided")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  #
+                  # Do stuff
+                  #
+                  paginator = s3_client.get_paginator('list_object_versions')
+                  iterator = paginator.paginate(Bucket=parameters['Bucket'])
+                  for page in iterator:
+                      if 'Versions' not in page:
+                          continue
+          
+                      obj_list = []
+                      for version in page['Versions']:
+                          obj_list.append({'Key': version['Key'], 'VersionId': version['VersionId']})
+          
+                      kill_object = {'Quiet': False, 'Objects': obj_list}
+                      s3_client.delete_objects(Bucket=parameters['Bucket'], Delete=kill_object)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+          
+                  return response_data
+              except:
+                  logger.exception(event)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+  EmptyLambdaCodeBucket:
+    Type: Custom::EmptyLambdaCodeBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketFunction.Arn
+      Bucket: !Ref LambdaCodeBucket
+
+
+  LayerCodeBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "LayerCodeBuilderS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LayerCodeBuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Builds the code dependencies for the Lambda layer used by functions in this project"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 900
+      Role: !GetAtt LayerCodeBuilderRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref LambdaCodeBucket
+          S3_KEY_PREFIX: 'export-code/'
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import sys
+          import shutil
+          import subprocess            
+          import zipfile
+          
+          from datetime import datetime
+          
+          target_bucket = os.environ['S3_BUCKET']
+
+          def upload_file_to_s3(file_path, bucket, key):
+              s3 = boto3.client('s3')
+              s3.upload_file(file_path, bucket, key)
+              print(f"Upload successful. {file_path} uploaded to {bucket}/{key}")
+
+          def make_zip_filename():
+            now = datetime.now()
+            timestamp = now.strftime('%Y%m%d_%H%M%S')
+            filename = f'PyLedgerExportLayers_{timestamp}.zip'
+            return filename
+
+          def zipdir(path, zipname):
+            zipf = zipfile.ZipFile(zipname, 'w', zipfile.ZIP_DEFLATED)
+            for root, dirs, files in os.walk(path):
+                for file in files:
+                    zipf.write(os.path.join(root, file),
+                              os.path.relpath(os.path.join(root, file), 
+                                              os.path.join(path, '..')))
+            zipf.close()
+  
+          def handler(event, context):              
+            try:
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+                
+              layers = ['psycopg', 'pyqldb']
+              os.chdir('/tmp')
+              
+              # clear temp modules path, recreate modules path
+              if os.path.exists("python"):
+                shutil.rmtree("python")
+              os.mkdir("python")
+
+              for layer in layers:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", layer, "-t", "python", "--upgrade"])
+                
+              target_zip_file = make_zip_filename()
+              zipdir('python', target_zip_file)
+
+              zipkey = ''
+              if 'S3_KEY_PREFIX' in os.environ:
+                zipkey = os.environ['S3_KEY_PREFIX']         
+                if zipkey == '/':
+                  zipkey = ''
+                elif len(zipkey) > 0 and not zipkey.endswith('/'):
+                  zipkey = zipkey + '/'
+          
+              zipkey = zipkey + target_zip_file
+          
+              upload_file_to_s3(target_zip_file, target_bucket, zipkey)
+              responseData = {'Bucket': target_bucket, 'Key': zipkey}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)            
+
+  # Invokes the function to build the zip file of dependencies that our Lambda layer will use
+  BuildLayerCode:
+    Type: Custom::BuildLambdaLayerCode
+    Properties:
+      ServiceToken: !GetAtt LayerCodeBuilderFunction.Arn
+
+  LambdaLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      LayerName: LedgerExportLayer
+      Content:
+        S3Bucket: !GetAtt BuildLayerCode.Bucket
+        S3Key: !GetAtt BuildLayerCode.Key
+      CompatibleRuntimes:
+        - python3.11
+
+
+  ########################################################################################
+  # Create VPC and networking
+  ########################################################################################
+
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      Tags:
+        - Key: "Name"
+          Value: !Ref VPCName
+
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+
+  GatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTableIGW:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [ " ", [ !Ref VPCName, "Through IGW" ] ]
+
+  IGWAllTrafficRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTableIGW
+
+  #
+  # First AZ networking
+  #
+  PublicSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref 'AWS::Region']
+      CidrBlock: !Select [0, !Ref PublicSubnetCIDRs]
+      MapPublicIpOnLaunch: "true"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Public Subnet", !Select [0, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  PublicSubnetRoute1:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTableIGW
+      SubnetId: !Ref PublicSubnet1
+
+  NATEIP1:
+    Type: "AWS::EC2::EIP"
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: "vpc"
+
+  NAT1:
+    Type: "AWS::EC2::NatGateway"
+    Properties:
+      AllocationId: !GetAtt NATEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  RouteTableNAT1:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Through NAT", !GetAtt PublicSubnet1.AvailabilityZone]]
+
+  NATAllTrafficRoute1:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      RouteTableId: !Ref RouteTableNAT1
+      NatGatewayId: !Ref NAT1
+
+  DatabaseSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !GetAtt PublicSubnet1.AvailabilityZone
+      CidrBlock: !Select [0, !Ref DatabaseSubnetCIDRs]
+      MapPublicIpOnLaunch: "false"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Data Subnet", !GetAtt PublicSubnet1.AvailabilityZone]]
+
+  DatabaseSubnetRoute1:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTableNAT1
+      SubnetId: !Ref DatabaseSubnet1
+
+  #
+  # Second AZ networking
+  #
+  PublicSubnet2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref 'AWS::Region']
+      CidrBlock: !Select [1, !Ref PublicSubnetCIDRs]
+      MapPublicIpOnLaunch: "true"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Public Subnet", !Select [1, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  PublicSubnetRoute2:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTableIGW
+      SubnetId: !Ref PublicSubnet2
+
+  NATEIP2:
+    Type: "AWS::EC2::EIP"
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: "vpc"
+
+  NAT2:
+    Type: "AWS::EC2::NatGateway"
+    Properties:
+      AllocationId: !GetAtt NATEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  RouteTableNAT2:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Through NAT", !GetAtt PublicSubnet2.AvailabilityZone]]
+
+  NATAllTrafficRoute2:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      RouteTableId: !Ref RouteTableNAT2
+      NatGatewayId: !Ref NAT2
+
+  DatabaseSubnet2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !GetAtt PublicSubnet2.AvailabilityZone
+      CidrBlock: !Select [1, !Ref DatabaseSubnetCIDRs]
+      MapPublicIpOnLaunch: "false"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Data Subnet", !GetAtt PublicSubnet2.AvailabilityZone]]
+
+  DatabaseSubnetRoute2:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTableNAT2
+      SubnetId: !Ref DatabaseSubnet2
+
+  #
+  # Third AZ networking
+  #
+  PublicSubnet3:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref 'AWS::Region']
+      CidrBlock: !Select [2, !Ref PublicSubnetCIDRs]
+      MapPublicIpOnLaunch: "true"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Public Subnet", !Select [2, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  PublicSubnetRoute3:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTableIGW
+      SubnetId: !Ref PublicSubnet3
+
+  NATEIP3:
+    Type: "AWS::EC2::EIP"
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: "vpc"
+
+  NAT3:
+    Type: "AWS::EC2::NatGateway"
+    Properties:
+      AllocationId: !GetAtt NATEIP3.AllocationId
+      SubnetId: !Ref PublicSubnet3
+
+  RouteTableNAT3:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Through NAT", !GetAtt PublicSubnet3.AvailabilityZone]]
+
+  NATAllTrafficRoute3:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      RouteTableId: !Ref RouteTableNAT3
+      NatGatewayId: !Ref NAT3
+
+  DatabaseSubnet3:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !GetAtt PublicSubnet3.AvailabilityZone
+      CidrBlock: !Select [2, !Ref DatabaseSubnetCIDRs]
+      MapPublicIpOnLaunch: "false"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: "Name"
+          Value: !Join [" ", [!Ref VPCName, "Data Subnet", !GetAtt PublicSubnet3.AvailabilityZone]]
+
+  DatabaseSubnetRoute3:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTableNAT3
+      SubnetId: !Ref DatabaseSubnet3
+
+
+  ########################################################################################
+  # Create and prep QLDB source ledger
+  ########################################################################################
+
+  Ledger:
+    Type: AWS::QLDB::Ledger
+    Properties:
+      DeletionProtection: False
+      Name: !Ref LedgerName
+      PermissionsMode: "STANDARD"
+
+  LedgerSetupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "LedgerSendCommandAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "qldb:SendCommand"
+                Resource:
+                  - !Sub "arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${LedgerName}"
+        - PolicyName: "LedgerPartiQLAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "qldb:PartiQL*"
+                Resource:
+                  - !Sub "arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${LedgerName}/*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LedgerSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Loads the DMV ledger with sample data"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt LedgerSetupFunctionRole.Arn
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          LEDGER_NAME: !Ref LedgerName
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          from decimal import Decimal
+          import os
+          import time
+          
+          from datetime import datetime
+          from pyqldb.driver.qldb_driver import QldbDriver
+          
+          def create_tables(tx):
+            tx.execute_statement("CREATE TABLE VehicleRegistration")
+            tx.execute_statement("CREATE INDEX ON VehicleRegistration(LicenseNumber)")
+            tx.execute_statement("CREATE INDEX ON VehicleRegistration(PersonId)")
+            tx.execute_statement("CREATE TABLE DriversLicense")
+            tx.execute_statement("CREATE INDEX ON DriversLicense(LicenseNumber)")
+            tx.execute_statement("CREATE INDEX ON DriversLicense(PersonId)")
+            tx.execute_statement("CREATE TABLE Vehicle")
+            tx.execute_statement("CREATE INDEX ON Vehicle(VIN)")
+            tx.execute_statement("CREATE TABLE Person")
+            tx.execute_statement("CREATE INDEX ON Person(GovId)")
+          
+          def insert_documents(tx):
+            vehicles = [
+              {
+                'VIN': '1N4AL11D75C109151',
+                'Type': 'Sedan',
+                'Year': 2011,
+                'Make': 'Audi',
+                'Model': 'A5',
+                'Color': 'Silver'
+              },
+              {
+                'VIN': 'KM8SRDHF6EU074761',
+                'Type': 'Sedan',
+                'Year': 2015,
+                'Make': 'Tesla',
+                'Model': 'Model S',
+                'Color': 'Blue'
+              },
+              {
+                'VIN': '3HGGK5G53FM761765',
+                'Type': 'Motorcycle',
+                'Year': 2011,
+                'Make': 'Ducati',
+                'Model': 'Monster 1200',
+                'Color': 'Yellow'
+              },
+              {
+                'VIN': '1HVBBAANXWH544237',
+                'Type': 'Semi',
+                'Year': 2009,
+                'Make': 'Ford',
+                'Model': 'F 150',
+                'Color': 'Black'
+              },
+              {
+                'VIN': '1C4RJFAG0FC625797',
+                'Type': 'Sedan',
+                'Year': 2019,
+                'Make': 'Mercedes',
+                'Model': 'CLK 350',
+                'Color': 'White'
+              }
+            ]
+          
+            people = [
+              {
+                'FirstName': 'Raul',
+                'LastName': 'Lewis',
+                'Address': '1719 University Street, Seattle, WA, 98109',
+                'DOB': datetime(1963, 8, 19),
+                'GovId': 'LEWISR261LL',
+                'GovIdType': 'Driver License'
+              },
+              {
+                'FirstName': 'Brent',
+                'LastName': 'Logan',
+                'DOB': datetime(1967, 7, 3),
+                'Address': '43 Stockert Hollow Road, Everett, WA, 98203',
+                'GovId': 'LOGANB486CG',
+                'GovIdType': 'Driver License'
+              },
+              {
+                'FirstName': 'Alexis',
+                'LastName': 'Pena',
+                'DOB': datetime(1974, 2, 10),
+                'Address': '4058 Melrose Street, Spokane Valley, WA, 99206',
+                'GovId': '744 849 301',
+                'GovIdType': 'SSN'
+              },
+              {
+                'FirstName': 'MelVIN',
+                'LastName': 'Parker',
+                'DOB': datetime(1976, 5, 22),
+                'Address': '4362 Ryder Avenue, Seattle, WA, 98101',
+                'GovId': 'P626-168-229-765',
+                'GovIdType': 'Passport'
+              },
+              {
+                'FirstName': 'Salvatore',
+                'LastName': 'Spencer',
+                'DOB': datetime(1997, 11, 15),
+                'Address': '4450 Honeysuckle Lane, Seattle, WA, 98101',
+                'GovId': 'S152-780-97-415-0',
+                'GovIdType': 'Passport'
+              }
+            ]
+                        
+            tx.execute_statement('insert into Vehicle ?', vehicles)
+            person_ids = []
+            cursor = tx.execute_statement('insert into Person ?', people)
+            for rec in cursor:
+              person_ids.append(rec['documentId'])
+          
+            licenses = [
+              {
+                'PersonId': person_ids[0],
+                'LicenseNumber': 'LEWISR261LL',
+                'LicenseType': 'Learner',
+                'ValidFromDate': datetime(2016, 12, 20),
+                'ValidToDate': datetime(2020, 11, 15)
+              },
+              {
+                'PersonId': person_ids[1],
+                'LicenseNumber': 'LOGANB486CG',
+                'LicenseType': 'Probationary',
+                'ValidFromDate': datetime(2016, 4, 6),
+                'ValidToDate': datetime(2020, 11, 15)
+              },
+              {
+                'PersonId': person_ids[2],
+                'LicenseNumber': '744 849 301',
+                'LicenseType': 'Full',
+                'ValidFromDate': datetime(2017, 12, 6),
+                'ValidToDate': datetime(2022, 10, 15)
+              },
+              {
+                'PersonId': person_ids[3],
+                'LicenseNumber': 'P626-168-229-765',
+                'LicenseType': 'Learner',
+                'ValidFromDate': datetime(2017, 8, 16),
+                'ValidToDate': datetime(2021, 11, 15)
+              },
+              {
+                'PersonId': person_ids[4],
+                'LicenseNumber': 'S152-780-97-415-0',
+                'LicenseType': 'Probationary',
+                'ValidFromDate': datetime(2015, 8, 15),
+                'ValidToDate': datetime(2021, 8, 21)
+              }
+            ]
+          
+            tx.execute_statement('insert into DriversLicense ?', licenses)
+          
+            registrations = [
+              {
+                'VIN': '1N4AL11D75C109151',
+                'LicensePlateNumber': 'LEWISR261LL',
+                'State': 'WA',
+                'City': 'Seattle',
+                'ValidFromDate': datetime(2017, 8, 21),
+                'ValidToDate': datetime(2020, 5, 11),
+                'PendingPenaltyTicketAmount': Decimal('90.25'),
+                'Owners': {
+                    'PrimaryOwner': {'PersonId': person_ids[0]},
+                    'SecondaryOwners': []
+                }
+              },
+              {
+                'VIN': 'KM8SRDHF6EU074761',
+                'LicensePlateNumber': 'CA762X',
+                'State': 'WA',
+                'City': 'Kent',
+                'PendingPenaltyTicketAmount': Decimal('130.75'),
+                'ValidFromDate': datetime(2017, 9, 14),
+                'ValidToDate': datetime(2020, 6, 25),
+                'Owners': {
+                    'PrimaryOwner': {'PersonId': person_ids[1]},
+                    'SecondaryOwners': []
+                }
+              },
+              {
+                'VIN': '3HGGK5G53FM761765',
+                'LicensePlateNumber': 'CD820Z',
+                'State': 'WA',
+                'City': 'Everett',
+                'PendingPenaltyTicketAmount': Decimal('442.30'),
+                'ValidFromDate': datetime(2011, 3, 17),
+                'ValidToDate': datetime(2021, 3, 24),
+                'Owners': {
+                    'PrimaryOwner': {'PersonId': person_ids[2]},
+                    'SecondaryOwners': []
+                }
+              },
+              {
+                'VIN': '1HVBBAANXWH544237',
+                'LicensePlateNumber': 'LS477D',
+                'State': 'WA',
+                'City': 'Tacoma',
+                'PendingPenaltyTicketAmount': Decimal('42.20'),
+                'ValidFromDate': datetime(2011, 10, 26),
+                'ValidToDate': datetime(2023, 9, 25),
+                'Owners': {
+                    'PrimaryOwner': {'PersonId': person_ids[3]},
+                    'SecondaryOwners': []
+                }
+              },
+              {
+                'VIN': '1C4RJFAG0FC625797',
+                'LicensePlateNumber': 'TH393F',
+                'State': 'WA',
+                'City': 'Olympia',
+                'PendingPenaltyTicketAmount': Decimal('30.45'),
+                'ValidFromDate': datetime(2013, 9, 2),
+                'ValidToDate': datetime(2024, 3, 19),
+                'Owners': {
+                    'PrimaryOwner': {'PersonId': person_ids[4]},
+                    'SecondaryOwners': [person_ids[0]]
+                }
+              }
+            ]
+          
+            tx.execute_statement('insert into VehicleRegistration ?', registrations)
+            
+          def handler(event, context):              
+            try:
+              if event['RequestType'] != 'Create':          
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+
+              qldb_driver = QldbDriver(ledger_name=os.environ['LEDGER_NAME'])
+              qldb_driver.execute_lambda(lambda executor: create_tables(executor))
+              time.sleep(2)
+              qldb_driver.execute_lambda(lambda executor: insert_documents(executor))
+          
+              responseData = {}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)
+            
+  SetupLedger:
+    Type: Custom::SetupLedger
+    DependsOn: Ledger
+    Properties:
+      ServiceToken: !GetAtt LedgerSetupFunction.Arn
+
+  ########################################################################################
+  # Create and prep target Aurora PostgreSQL database
+  ########################################################################################
+
+  DatabaseAvailableCheckFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-DatabaseAvailabilityCheckAccess'
+      Description: 'Permissions for the database availability check function'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: 'RDSAPIAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'rds:DescribeDBInstances'
+                Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+  DatabaseAvailabilityCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      #Architectures: [ arm64 ]
+      Description: 'Sleeps until the database instance is available'
+      Handler: index.handler
+      Role: !GetAtt DatabaseAvailableCheckFunctionRole.Arn
+      Runtime: python3.11
+      Timeout: 900
+      Code:
+        ZipFile: | 
+          import boto3
+          import cfnresponse
+          import json
+          import time
+
+          rds = boto3.client('rds')
+
+          def handler(event, context):
+            try:
+              request_type = event['RequestType']
+              if request_type != 'Create' or 'ResourceProperties' not in event:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+                return {
+                  'statusCode': 200,
+                  'body': 'OK'
+                }
+                  
+              if 'TimeoutSeconds' not in event['ResourceProperties'] or 'DBInstanceIdentifier' not in event['ResourceProperties']:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, "CustomResourcePhysicalID", False, 'TimeoutSeconds and DBInstanceIdentifier parameters required')
+                return {
+                  'statusCode': 500,
+                  'body': 'TimeoutSeconds and DBInstanceIdentifier parameters required'
+                }
+                    
+              max_time = int(time.time()) + int(event['ResourceProperties']['TimeoutSeconds'])
+              available = False
+              
+              while time.time() < max_time:
+                response = rds.describe_db_instances(DBInstanceIdentifier=event['ResourceProperties']['DBInstanceIdentifier'])
+                available = response['DBInstances'][0]['DBInstanceStatus'] == 'available'
+                if available:
+                    break
+
+                time.sleep(15)
+                
+              if available:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+                return {
+                  'statusCode': 200,
+                  'body': 'OK'
+                }
+              else:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, "CustomResourcePhysicalID", False, 'Timed out before DB instance became available')
+                return {
+                  'statusCode': 500,
+                  'body': 'Timed out before DB instance became available'
+                }
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, "CustomResourcePhysicalID", False, str(e))
+              return {
+                'statusCode': 500,
+                'body': str(e)
+              }
+
+  DatabasePostgresUserPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: aurora-ledger-postgres-user
+      Description: "Credentials for the 'postgres' database user"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: True
+        IncludeSpace: False
+
+  DatabaseMigrateUserPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: aurora-ledger-migrate-user
+      Description: "Credentials for the 'migrate' database user"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "migrate"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: True
+        IncludeSpace: False
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Grants access to the PostgreSQL port on the host'
+      GroupName: !Sub "${VPCName} Postgres Access"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !GetAtt VPC.CidrBlock
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  DataSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: "Data Subnets"
+      DBSubnetGroupDescription: "Data subnets"
+      SubnetIds:
+        - !Ref DatabaseSubnet1
+        - !Ref DatabaseSubnet2
+        - !Ref DatabaseSubnet3
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DatabaseName: !Ref AuroraDatabaseName
+      DBClusterIdentifier: aurora-ledger
+      DBSubnetGroupName: !Ref DataSubnets
+      DeletionProtection: False
+      EnableCloudwatchLogsExports:
+        - postgresql
+      EnableHttpEndpoint: True
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: 15.5
+      MasterUsername: !Join [ "", [ "{{resolve:secretsmanager:", !Ref DatabasePostgresUserPassword, ":SecretString:username}}" ]]
+      MasterUserPassword: !Join [ "", [ "{{resolve:secretsmanager:", !Ref DatabasePostgresUserPassword, ":SecretString:password}}" ]]
+      Port: 5432
+      VpcSecurityGroupIds:
+        - !GetAtt VPC.DefaultSecurityGroup
+        - !GetAtt DatabaseSecurityGroup.GroupId
+
+  WriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: !Ref AuroraDBInstanceClass
+      DBInstanceIdentifier: aurora-ledger1
+      Engine: aurora-postgresql
+      EnablePerformanceInsights: True
+
+  PostgresUserSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DatabasePostgresUserPassword
+      TargetId: !Ref AuroraCluster
+      TargetType: AWS::RDS::DBCluster
+
+  MigrateUserSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DatabaseMigrateUserPassword
+      TargetId: !Ref AuroraCluster
+      TargetType: AWS::RDS::DBCluster
+
+  WriterInstanceAvailable:
+    Type: Custom::DatabaseAvailable
+    Properties:
+      ServiceToken: !GetAtt DatabaseAvailabilityCheckFunction.Arn
+      TimeoutSeconds:  800
+      DBInstanceIdentifier: !Ref WriterInstance
+
+  DatabasePrepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'SecretsAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref DatabaseMigrateUserPassword
+        - PolicyName: 'DataAPIAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'rds-data:BatchExecuteStatement'
+                  - 'rds-data:BeginTransaction'
+                  - 'rds-data:CommitTransaction'
+                  - 'rds-data:ExecuteStatement'
+                  - 'rds-data:RollbackTransaction'
+                Resource:
+                  - !GetAtt AuroraCluster.DBClusterArn
+              - Effect: 'Allow'
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref DatabasePostgresUserPassword
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+
+  DatabasePrepFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Executes DDL statements on the Aurora PostgreSQL target database, each statement in its own transaction"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 300
+      Role: !GetAtt DatabasePrepFunctionRole.Arn
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !GetAtt AuroraCluster.DBClusterArn
+          DB_NAME: !Ref AuroraDatabaseName
+          SECRET_ARN: !Ref DatabasePostgresUserPassword
+      Code:
+        ZipFile: |          
+          import boto3
+          import cfnresponse
+          import json
+          import os
+          import re
+          
+          rds_data = boto3.client('rds-data')
+          secrets_mgr = boto3.client('secretsmanager')
+          
+          #
+          # Creates a SqlParameter object from the given values for use in the
+          # RDS Data API.
+          #
+          # See https://docs.aws.amazon.com/rdsdataservice/latest/APIReference/API_SqlParameter.html
+          #
+          def make_parameter(name, value, datatype, hint=None):
+            if value == None:
+              datatype = 'isNull'
+              value = True
+        
+            parameter = {
+              'name': name,
+              'value': {
+                  datatype: value
+              }
+            }
+        
+            if hint:
+              parameter['typeHint'] = hint
+        
+            return parameter
+          
+          
+          def execute_statements(statements, database_arn, database_name, credentials_arn, secrets):
+              for statement in statements:
+                statement = statement.strip()
+                if len(statement) == 0:
+                  continue
+          
+                srch = re.search(r"\${\w*}", statement)
+                if srch:
+                  token = srch.group(0)
+                  variable = token[2:len(token) - 1]
+                  if variable in secrets:
+                    statement = statement.replace(token, secrets[variable])
+          
+                try:
+                  pg_tx = rds_data.begin_transaction(resourceArn=database_arn, secretArn=credentials_arn,
+                                                     database=database_name)
+          
+                  rds_data.execute_statement(resourceArn=database_arn, secretArn=credentials_arn,
+                                             database=database_name, transactionId=pg_tx['transactionId'],
+                                             sql=statement)
+          
+                  rds_data.commit_transaction(resourceArn=database_arn, secretArn=credentials_arn,
+                                              transactionId=pg_tx['transactionId'])
+                except Exception as ex:
+                  try:
+                    rds_data.rollback_transaction(resourceArn=database_arn, secretArn=credentials_arn,
+                                                  transactionId=pg_tx['transactionId'])
+                  except:
+                    pass
+          
+                  raise ex
+          
+          
+          def handler(event, context):
+            try:
+              database_arn = os.environ['DB_CLUSTER_ARN']
+              database_name = os.environ['DB_NAME']
+              credentials_arn = os.environ['SECRET_ARN']
+          
+              if 'PhysicalResourceId' in event:
+                physical_id = event['PhysicalResourceId']
+              else:
+                physical_id = ''
+          
+              secrets = {}
+              if 'Secrets' in event['ResourceProperties']:
+                for secret_prop in event['ResourceProperties']['Secrets']:
+                  secret_val = secrets_mgr.get_secret_value(SecretId=secret_prop['SecretArn'])
+                  secret = json.loads(secret_val['SecretString'])
+                  secrets[secret_prop['Name']] = secret['password']   
+          
+              if event['RequestType'] == 'Update':
+                if 'DropStatements' in event['OldResourceProperties']:
+                  execute_statements(event['OldResourceProperties']['DropStatements'], database_arn, database_name, credentials_arn, secrets)
+          
+              if 'DropStatements' in event['ResourceProperties']:
+                execute_statements(event['ResourceProperties']['DropStatements'], database_arn, database_name, credentials_arn, secrets)
+          
+              if event['RequestType'] in ['Create', 'Update']:
+                if 'Statements' in event['ResourceProperties']:
+                  execute_statements(event['ResourceProperties']['Statements'], database_arn, database_name, credentials_arn, secrets)
+          
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=physical_id)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason, physicalResourceId=physical_id)
+
+
+  PrepareTargetDatabase:
+    Type: Custom::PrepareDatabase
+    DependsOn:
+      - WriterInstanceAvailable
+    Properties:
+      ServiceToken: !GetAtt DatabasePrepFunction.Arn
+      Secrets:
+        - Name: migrate
+          SecretArn: !Ref DatabaseMigrateUserPassword
+      DropStatements:
+        - drop table if exists dmv.person;
+        - drop table if exists dmv.vehicle;
+        - drop table if exists dmv.vehicle_registration;
+        - drop table if exists dmv.drivers_license;
+
+        - drop table if exists dmv.person_audit_log;
+        - drop table if exists dmv.vehicle_audit_log;
+        - drop table if exists dmv.vehicle_registration_audit_log;
+        - drop table if exists dmv.drivers_license_audit_log;
+        - drop table if exists foobar
+
+        - drop schema if exists dmv;
+        - drop role if exists migrate;
+        - drop role if exists dmv_users;
+      Statements:
+        - create schema dmv;
+        - >
+          create table dmv.person (
+              doc_id varchar(25),
+              version integer,
+              person_id varchar(25),
+              first_name varchar(100),
+              last_name varchar(100),
+              dob date,
+              gov_id varchar(50),
+              gov_id_type varchar(50),
+              address varchar(100),
+              ql_audit jsonb
+          );
+
+        - >
+          create table dmv.vehicle (
+              doc_id varchar(25),
+              version integer,
+              vin varchar(50),
+              type varchar(25),
+              year integer,
+              make varchar(50),
+              model varchar(50),
+              color varchar(25),
+              ql_audit jsonb
+          );
+
+        - >
+          create table dmv.vehicle_registration (
+              doc_id varchar(25),
+              version integer,
+              vin varchar(50),
+              license_plate_num varchar(25),
+              state varchar(10),
+              city varchar(25),
+              pending_penalty_amt decimal,
+              valid_from_dt date,
+              valid_to_dt date,
+              primary_owner varchar(25),
+              secondary_owners varchar(200),
+              ql_audit jsonb
+          );
+
+        - >
+          create table dmv.drivers_license (
+              doc_id varchar(25),
+              version integer,
+              person_id varchar(25),
+              license_plate_num varchar(25),
+              license_type varchar(25),
+              valid_from_dt date,
+              valid_to_dt date,
+              ql_audit jsonb
+          );
+
+        - >
+          create table dmv.person_audit_log (
+              doc_id varchar(25),
+              version integer,
+              person_id varchar(25),
+              first_name varchar(100),
+              last_name varchar(100),
+              dob date,
+              gov_id varchar(50),
+              gov_id_type varchar(50),
+              address varchar(100),
+              ql_audit jsonb,
+              operation character(1),
+              transaction_id character varying,
+              old_row_data jsonb
+          );
+
+        - >
+          create table dmv.vehicle_audit_log (
+              doc_id varchar(25),
+              version integer,
+              vin varchar(50),
+              type varchar(25),
+              year integer,
+              make varchar(50),
+              model varchar(50),
+              color varchar(25),
+              ql_audit jsonb,
+              operation character(1),
+              transaction_id character varying,
+              old_row_data jsonb
+          );
+
+        - >
+          create table dmv.vehicle_registration_audit_log (
+              doc_id varchar(25),
+              version integer,
+              vin varchar(50),
+              license_plate_num varchar(25),
+              state varchar(10),
+              city varchar(25),
+              pending_penalty_amt decimal,
+              valid_from_dt date,
+              valid_to_dt date,
+              primary_owner varchar(25),
+              secondary_owners varchar(200),
+              ql_audit jsonb,
+              operation character(1),
+              transaction_id character varying,
+              old_row_data jsonb
+          );
+
+        - >
+          create table dmv.drivers_license_audit_log (
+              doc_id varchar(25),
+              version integer,
+              person_id varchar(25),
+              license_plate_num varchar(25),
+              license_type varchar(25),
+              valid_from_dt date,
+              valid_to_dt date,
+              ql_audit jsonb,
+              operation character(1),
+              transaction_id character varying,
+              old_row_data jsonb
+          );
+
+        - create role dmv_users;
+        - grant usage on schema dmv to dmv_users;
+        - grant select, insert, update, delete, truncate on all tables in schema dmv to dmv_users;
+        - create user migrate with password '${migrate}'
+        - grant dmv_users to migrate
+
+
+Outputs:
+  LedgerName:
+    Description: 'The name of the QLDB DMV ledger'
+    Value: !Ref LedgerName
+
+  DatabaseSubnets:
+    Description: 'IDs of the subnets the database can live in'
+    Value: !Join [', ', [!Ref DatabaseSubnet1, !Ref DatabaseSubnet2, !Ref DatabaseSubnet3]]
+
+  DatabaseSecurityGroups:
+    Description: 'The IDs of the database security group and default VPC security group'
+    Value: !Join [', ', [!GetAtt DatabaseSecurityGroup.GroupId, !GetAtt VPC.DefaultSecurityGroup]]
+
+  PostgresDatabaseUserSecretName:
+    Description: 'Name of the SecretsManager secret containing credentials for the "postgres" database user'
+    Value: aurora-ledger-postgres-user
+
+  PostgresDatabaseUserSecretARN:
+    Description: 'ARN of the SecretsManager secret containing credentials for the "postgres" database user'
+    Value: !Ref DatabasePostgresUserPassword
+
+  MigrateDatabaseUserSecretName:
+    Description: 'Name of the SecretsManager secret containing credentials for the "migrate" database user'
+    Value: aurora-ledger-migrate-user
+
+  MigrateDatabaseUserSecretARN:
+    Description: 'ARN of the SecretsManager secret containing credentials for the "migrate" database user'
+    Value: !Ref DatabaseMigrateUserPassword
+
+  AuroraClusterArn:
+    Description: 'The ARN or the target Aurora database cluster'
+    Value: !GetAtt AuroraCluster.DBClusterArn
+
+  TargetDatabaseName:
+    Description: "The name of the database to create in the Aurora cluster"
+    Value: !Ref AuroraDatabaseName

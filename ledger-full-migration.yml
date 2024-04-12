@@ -1,0 +1,1582 @@
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates a Glue job to transform QLDB export files into a CSV format that Database Migration Service can use
+  as input.  The template also creates a DMS task to migrate the QLDB data from the CSV files into Aurora PostgreSQL.
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Ledger'
+        Parameters:
+          - LedgerName
+      - Label:
+          default: 'Export'
+        Parameters:
+          - ExportIds
+          - ExportBasePrefix
+      - Label:
+          default: 'Glue Job'
+        Parameters:
+          - GlueWorkerType
+          - NumberOfGlueWorkers
+      - Label:
+          default: 'DMS'
+        Parameters:
+          - ReplicationInstanceSubnets
+          - ReplicationInstanceClass
+          - SecurityGroups
+          - TargetDatabaseSecretName
+          - TargetDatabaseName
+
+
+Parameters:
+  LedgerName:
+    Description: "The name of the DMV QLDB ledger"
+    Type: "String"
+
+  GlueWorkerType:
+    Description: 'The worker type specifying capacity for each node running the Glue job'
+    Type: "String"
+    Default: 'G.2X'
+    AllowedValues: ['G.1X', 'G.2X', 'G.025X', 'G.4X', 'G.8X']
+
+  NumberOfGlueWorkers:
+    Description: 'The number of Glue nodes to spread the ETL job across, running concurrently'
+    Type: 'Number'
+    Default: 2
+    MinValue: 1
+
+  ExportBasePrefix:
+    Description: 'The base S3 prefix containing the ledger exports. Should contain a trailing slash.'
+    Type: 'String'
+
+  ExportIds:
+    Description: 'A comma-delimited list of ledger export IDs to process'
+    Type: 'String'
+
+  ReplicationInstanceSubnets:
+    Description: 'The subnets to place the DMS replication instance into'
+    Type: List<AWS::EC2::Subnet::Id>
+
+  ReplicationInstanceClass:
+    Description: 'Instance class for the DMS replication instance'
+    Default: 'dms.r6i.large'
+    Type: 'String'
+
+  SecurityGroups:
+    Description: 'Security groups to attach to the replication instance'
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+  TargetDatabaseSecretName:
+    Description: 'The name of the SecretsManager secret containing the database credentials and connection info for use by DMS'
+    Type: 'String'
+
+  TargetDatabaseName:
+    Description: 'The name of the database on the target database host'
+    Type: 'String'
+
+
+Resources:
+  GlueOutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'ledger-etl-${AWS::AccountId}'
+
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+
+  EmptyS3BucketFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "EmptyS3BucketFunctionRights"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketVersions"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  EmptyS3BucketFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Deletes all objects and object versions from an S3 bucket"
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !GetAtt EmptyS3BucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          import boto3
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+          
+          s3_client = boto3.client('s3')
+          
+          
+          def handler(event, context):
+              respond_to_cfn = not ('test' in event or (__name__ == "__main__"))
+              response_data = {}
+          
+              if 'RequestType' not in event or event['RequestType'] != 'Delete':
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  return
+          
+              try:
+                  #
+                  # Validate inputs
+                  #
+                  if 'ResourceProperties' not in event:
+                      logger.error("Invalid event:  event does not contain 'ResourceProperties'")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  parameters = event['ResourceProperties']
+                  if 'Bucket' not in parameters or len(parameters['Bucket']) < 1:
+                      logger.error("Bucket parameter not provided")
+                      if respond_to_cfn:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+          
+                  #
+                  # Do stuff
+                  #
+                  paginator = s3_client.get_paginator('list_object_versions')
+                  iterator = paginator.paginate(Bucket=parameters['Bucket'])
+                  for page in iterator:
+                      if 'Versions' not in page:
+                          continue
+          
+                      obj_list = []
+                      for version in page['Versions']:
+                          obj_list.append({'Key': version['Key'], 'VersionId': version['VersionId']})
+          
+                      kill_object = {'Quiet': False, 'Objects': obj_list}
+                      s3_client.delete_objects(Bucket=parameters['Bucket'], Delete=kill_object)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+          
+                  return response_data
+              except:
+                  logger.exception(event)
+          
+                  if respond_to_cfn:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+  EmptyLambdaCodeBucket:
+    Type: Custom::EmptyLambdaCodeBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketFunction.Arn
+      Bucket: !Ref LambdaCodeBucket
+
+  S3ObjectPutterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "S3ObjectPutterS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  S3ObjectPutterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Writes provided object content to S3"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt S3ObjectPutterRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          s3 = boto3.client('s3')
+          
+          def handler(event, context):
+            try:
+              responseData = {}
+                    
+              if event['RequestType'] == 'Delete':
+                s3.delete_object(Bucket=event['ResourceProperties']['S3Bucket'], Key=event['ResourceProperties']['S3Key'])
+              elif event['RequestType'] == 'Create':          
+                s3.put_object(Bucket=event['ResourceProperties']['S3Bucket'], Key=event['ResourceProperties']['S3Key'],
+                              Body=event['ResourceProperties']['Body'].encode())
+              elif event['RequestType'] == 'Update':
+                  delete = False
+                  if event['ResourceProperties']['S3Bucket'] != event['OldResourceProperties']['S3Bucket']:
+                    delete = True
+                  elif event['ResourceProperties']['S3Key'] != event['OldResourceProperties']['S3Key']:
+                    delete = True
+          
+                  if delete:
+                    s3.delete_object(Bucket=event['OldResourceProperties']['S3Bucket'], Key=event['OldResourceProperties']['S3Key'])
+                    s3.put_object(Bucket=event['ResourceProperties']['S3Bucket'], Key=event['ResourceProperties']['S3Key'],
+                              Body=event['ResourceProperties']['Body'].encode())
+                  else:
+                    if event['ResourceProperties']['Body'] != event['OldResourceProperties']['Body']:
+                      s3.put_object(Bucket=event['ResourceProperties']['S3Bucket'], Key=event['ResourceProperties']['S3Key'],
+                              Body=event['ResourceProperties']['Body'].encode())
+
+              responseData['S3Url'] = 's3://{}/{}'.format(event['ResourceProperties']['S3Bucket'], event['ResourceProperties']['S3Key'])
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)
+
+  PutGlueJobCodeToS3:
+    Type: Custom::S3PutObject
+    Properties:
+      ServiceToken: !GetAtt S3ObjectPutterFunction.Arn
+      S3Bucket:  !Ref LambdaCodeBucket
+      S3Key:  'glue/ledger-etl-glue-job.py'
+      Body: |
+        import boto3
+        from dateutil import parser
+        import json
+        import sys
+        
+        from amazon.ion import simpleion
+        
+        from awsglue.context import GlueContext
+        from awsglue.dynamicframe import DynamicFrame
+        from awsglue.job import Job
+        from awsglue.transforms import *
+        from awsglue.utils import getResolvedOptions
+        
+        from pyspark.context import SparkContext
+        import pyspark.sql.functions as sf
+        from pyspark.sql.functions import desc
+        from pyspark.sql.functions import explode
+        from pyspark.sql.functions import lit
+        from pyspark.sql.functions import rank
+        from pyspark.sql.window import Window
+        from pyspark.sql.types import *
+        
+        from pyqldb.driver.qldb_driver import QldbDriver
+        
+        # Glue/Spark initialization stuff
+        args = getResolvedOptions(sys.argv,
+                                  ['JOB_NAME', 'ledger_name', 's3_output_base_uri', 'export_bucket', 'export_base_prefix',
+                                   'export_ids'])
+        
+        sc = SparkContext()
+        glueContext = GlueContext(sc)
+        
+        spark = glueContext.spark_session
+        job = Job(glueContext)
+        job.init(args['JOB_NAME'], args)
+        
+        
+        #
+        # Functions to convert table data
+        #
+        def convert_person(row):
+            data = row['data']
+        
+            dob = data.get('DOB', None)
+            if dob != None:
+                dob = parser.parse(dob).strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+            row['person_id'] = row['doc_id']
+            row['first_name'] = data.get('FirstName', None)
+            row['last_name'] = data.get('LastName', None)
+            row['dob'] = dob
+            row['gov_id'] = data.get('GovId', None)
+            row['gov_id_type'] = data.get('GovIdType', None)
+            row['address'] = data.get('Address', None)
+            del row['data']
+        
+            return row
+        
+        
+        def convert_vehicle(row):
+            data = row['data']
+        
+            row['vin'] = data.get('VIN', None)
+            row['type'] = data.get('Type', None)
+            row['year'] = data.get('Year', None)
+            row['make'] = data.get('Make', None)
+            row['model'] = data.get('Model', None)
+            row['color'] = data.get('Color', None)
+            del row['data']
+        
+            return row
+        
+        
+        def convert_vehicle_registration(row):
+            data = row['data']
+        
+            from_dt = data.get('ValidFromDate', None)
+            if from_dt != None:
+                from_dt = parser.parse(from_dt).strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+            to_dt = data.get('ValidToDate', None)
+            if to_dt != None:
+                to_dt = parser.parse(to_dt).strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+            row['vin'] = data.get('VIN', None)
+            row['license_plate_num'] = data.get('LicensePlateNumber', None)
+            row['state'] = data.get('State', None)
+            row['city'] = data.get('City', None)
+            row['pending_penalty_amt'] = data.get('PendingPenaltyTicketAmount', None)
+            row['valid_from_dt'] = from_dt
+            row['valid_to_dt'] = to_dt
+        
+            if 'Owners' in data:
+                owners = data['Owners']
+                if 'PrimaryOwner' in owners:
+                    row['primary_owner'] = owners['PrimaryOwner'].get('PersonId', None)
+                else:
+                    row['primary_owner'] = None
+        
+                if 'SecondaryOwners' in owners and len(owners['SecondaryOwners']) > 0:
+                    arr = []
+                    for secown in owners['SecondaryOwners']:
+                        if 'PersonId' in secown:
+                            arr.append(secown['PersonId'])
+        
+                    if len(arr) == 0:
+                        row['secondary_owners'] = None
+                    else:
+                        row['secondary_owners'] = ','.join(arr)
+                else:
+                    row['secondary_owners'] = None
+            else:
+                row['primary_owner'] = None
+                row['secondary_owners'] = None
+        
+            del row['data']
+            return row
+        
+        
+        def convert_drivers_license(row):
+            data = row['data']
+        
+            from_dt = data.get('ValidFromDate', None)
+            if from_dt != None:
+                from_dt = parser.parse(from_dt).strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+            to_dt = data.get('ValidToDate', None)
+            if to_dt != None:
+                to_dt = parser.parse(to_dt).strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+            row['person_id'] = data.get('PersonId', None)
+            row['license_plate_num'] = data.get('LicensePlateNumber', None)
+            row['license_type'] = data.get('LicenseType', None)
+            row['valid_from_dt'] = from_dt
+            row['valid_to_dt'] = to_dt
+        
+            del row['data']
+            return row
+        
+        
+        table_converters = {
+            'Person': {
+                'name': 'person',
+                'func': convert_person,
+                'columns': ['doc_id', 'version', 'person_id', 'first_name', 'last_name', 'dob', 'gov_id', 'gov_id_type',
+                            'address', 'ql_audit']
+        
+            },
+            'Vehicle': {
+                'name': 'vehicle',
+                'func': convert_vehicle,
+                'columns': ['doc_id', 'version', 'vin', 'type', 'year', 'make', 'model', 'color', 'ql_audit']
+            },
+            'VehicleRegistration': {
+                'name': 'vehicle_registration',
+                'func': convert_vehicle_registration,
+                'columns': ['doc_id', 'version', 'vin', 'license_plate_num', 'state', 'city', 'pending_penalty_amt',
+                            'valid_from_dt', 'valid_to_dt', 'primary_owner', 'secondary_owners', 'ql_audit']
+            },
+            'DriversLicense': {
+                'name': 'drivers_license',
+                'func': convert_drivers_license,
+                'columns': ['doc_id', 'version', 'person_id', 'license_plate_num', 'license_type', 'valid_from_dt',
+                            'valid_to_dt', 'ql_audit']
+            }
+        }
+        
+        
+        #
+        # Fetches the S3 paths of export files from an export's completed manifest.
+        #
+        def fetch_export_s3_paths():
+            qldb = boto3.client('qldb')
+            s3 = boto3.client('s3')
+        
+            digest_response = qldb.get_digest(Name=args['ledger_name'])
+            tip_address = simpleion.loads(digest_response['DigestTipAddress']['IonText'])
+            strand_id = tip_address['strandId']
+        
+            prefix = args['export_base_prefix']
+            if not prefix.endswith('/'):
+                prefix = prefix + '/'
+        
+            export_ids = args['export_ids'].split(',')
+            export_keys = []
+            for export_id in export_ids:
+                manifest = s3.get_object(Bucket=args['export_bucket'],
+                                         Key=(prefix + export_id.strip() + '.' + strand_id + '.completed.manifest'))
+                ion = simpleion.loads(manifest['Body'].read())
+                for key in ion['keys']:
+                    export_keys.append('s3://' + args['export_bucket'] + '/' + key)
+        
+            return export_keys
+        
+        
+        #
+        # Fetches the names and IDs of active tables in the QLDB ledger whose data we're processing.
+        #
+        def read_active_qldb_tables(transaction_executor):
+            cursor = transaction_executor.execute_statement(
+                "select name, tableId from information_schema.user_tables where status = 'ACTIVE'")
+            active_tables = {}
+            for doc in cursor:
+                active_tables[doc['tableId']] = doc['name']
+        
+            return active_tables
+        
+        
+        #
+        # Initializes the QLDB driver and invokes a function to fetch the names and IDs of 
+        # active tables in the QLDB ledger whose data we're processing.
+        #
+        def get_tables_from_ledger(ledger_name):
+            qldb_driver = QldbDriver(ledger_name=ledger_name)
+            return qldb_driver.execute_lambda(lambda executor: read_active_qldb_tables(executor))
+        
+        
+        #
+        # Processes a single ledger block, producing a "row" with a single column "revisions"
+        # containing the document revisions, if any, in the block.  Revisions for dropped tables
+        # are excluded.
+        #
+        def pull_revisions_with_tablenames(block):
+            table_map = {}
+            if "transactionInfo" not in block:
+                return null
+        
+            if "documents" not in block["transactionInfo"]:
+                return null
+        
+            counts = []
+            docs = block['transactionInfo']['documents']
+            for key in docs.keys():
+                table_map[key] = {'name': docs[key]['tableName'], 'id': docs[key]['tableId']}
+                cnt_row = {
+                    'table_id': docs[key]['tableId'],
+                    'table_name': docs[key]['tableName'],
+                    'is_active': docs[key]['tableId'] in active_tables_df.value,
+                    'count': 1
+                }
+        
+                counts.append(cnt_row)
+        
+            arr = []
+            if 'revisions' in block:
+                for revision in block['revisions']:
+                    if 'metadata' not in revision:
+                        continue
+        
+                    metadata = revision['metadata']
+                    blockAddress = revision['blockAddress']
+        
+                    table_id = table_map[metadata['id']]['id']
+                    if table_id not in active_tables_df.value:
+                        continue
+        
+                    # Convert the transaction timestamp to a format DMS understands
+                    txTime = parser.parse(metadata['txTime']).strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+                    audit = {
+                        'ql_id': metadata['id'],
+                        'ql_v': metadata['version'],
+                        'ql_txid': metadata['txId'],
+                        'ql_txtime': txTime,
+                        'ql_blockseq': blockAddress['sequenceNo'],
+                        'ql_strand': blockAddress['strandId'],
+                        'ql_rev_hash': revision['hash'],
+                        'ql_tableid': table_id,
+                        'ql_tablename': table_map[metadata['id']]['name'],
+                        'ql_deletion': False,
+                        'ql_redacted': False,
+                        'ql_data_hash': ''
+                    }
+        
+                    row = {
+                        'doc_id': metadata['id'],
+                        'version': metadata['version'],
+                        'transaction_id': metadata['txId'],
+                        'table': table_map[metadata['id']]['name'],
+                        'data': {}
+                    }
+        
+                    if metadata['version'] == 0:
+                        row['operation'] = 'I'
+                    else:
+                        row['operation'] = 'U'
+        
+                    if 'data' in revision:
+                        row['data'] = revision['data']
+                    else:
+                        if 'dataHash' in revision:
+                            audit['ql_redacted'] = True
+                            audit['ql_data_hash'] = revision['dataHash']
+                        else:
+                            audit['ql_deletion'] = True
+                            row['operation'] = 'D'
+        
+                    row['ql_audit'] = json.dumps(audit)
+                    arr.append(row)
+        
+            obj = {'counts': counts}
+            if len(arr) > 0:
+                obj['revisions'] = arr
+        
+            return obj
+        
+        
+        #
+        # Send our dynamic frame to s3
+        #
+        def send_to_s3(dyn_frame, table_name):
+            uri = args['s3_output_base_uri']
+            if not uri.endswith('/'):
+                uri = uri + '/'
+        
+            uri = uri + table_name + '/'
+            glueContext.write_dynamic_frame.from_options(frame=dyn_frame, connection_type="s3",
+                                                         connection_options={"path": uri},
+                                                         format="csv")
+        
+        
+        # Fetch the names and IDs of currently-active (not dropped) tables in the ledger and broadcast
+        # them to all processing nodes in the cluster
+        active_tables = get_tables_from_ledger(args['ledger_name'])
+        active_tables_df = sc.broadcast(active_tables)
+        
+        # Load raw exports from S3
+        dyn0 = glueContext.create_dynamic_frame_from_options(connection_type='s3',
+                                                             connection_options={"paths": fetch_export_s3_paths()},
+                                                             format="json")
+        
+        # Extract revisions from exported ledger blocks. This gives us one row per block, each containing
+        # a single column called 'revisions' that is an array of revisions from the block
+        dyn1 = dyn0.map(pull_revisions_with_tablenames)
+        df0 = dyn1.toDF()
+        
+        # Explode out the list of revisions per block into rows, one row per revision. This gives us
+        # a dataframe with a single column 'col' that contains a struct object representing the revision.
+        df1 = df0.select(explode(df0.revisions))
+        
+        # Having our data nested as a struct below a root-level field called 'col' is inconvenient, so
+        # promote the nested elements as root-level columns.  Our revision fields are variable, so we'll
+        # keep that as a nested struct under 'data' for now.
+        df1 = df1.selectExpr('col.doc_id as doc_id', 'col.version as version', 'col.operation as operation',
+                             'col.transaction_id as transaction_id', 'col.table as table', 'col.ql_audit as ql_audit',
+                             'col.data as data')
+        
+        # Now we have to figure out which revision of each document is the latest.
+        window_spec = Window.partitionBy("doc_id").orderBy(desc("version"))
+        df1 = df1.withColumn('is_latest', lit(rank().over(window_spec) == 1))
+        
+        for ledger_table in table_converters:
+            # Grab only records for this table
+            df_table = df1.filter("table = '%s'" % ledger_table)
+        
+            # Now "flatten" this table's document structure into columns
+            dyn_table = DynamicFrame.fromDF(df_table, glueContext, 'dyn_table')
+            dyn_table = dyn_table.map(table_converters[ledger_table]['func'])
+        
+            # Process our "current" table, containing only the latest non-deleted revision of each document. Flatten its data model.
+            dyn_current = dyn_table.filter(f=lambda x: x["is_latest"] and x['operation'] != 'D')
+            dyn_current = dyn_current.select_fields(paths=table_converters[ledger_table]['columns'])
+            send_to_s3(dyn_current, table_converters[ledger_table]['name'])
+        
+            # Now process our "audit" table, containing all revisions of all documents in the table
+            cols = table_converters[ledger_table]['columns'].copy()
+            cols.extend(['operation', 'transaction_id'])
+            dyn_table = dyn_table.select_fields(paths=cols)
+            send_to_s3(dyn_table, table_converters[ledger_table]['name'] + '_audit_log')
+        
+        #
+        # Explode out the list of table counts per block into rows, one row (count) per revision. This gives us
+        # a dataframe with a single column 'col' that contains a struct object representing the counts of revisions in tables
+        # for the block.
+        #
+        df_tblcnt = df0.select(explode(df0.counts))
+        df_tblcnt = df_tblcnt.selectExpr('col.table_name as table_name', 'col.table_id as table_id',
+                                         'col.is_active as is_active', 'col.count as count')
+        df_tblcnt = df_tblcnt.groupBy('table_id', 'table_name', 'is_active').agg(sf.sum('count').alias('revision_cnt'))
+        df_tblcnt = df_tblcnt.selectExpr('table_name', 'table_id', 'is_active', 'revision_cnt')  # just re-order the columnns
+        df_tblcnt = df_tblcnt.coalesce(1).sort('table_name', 'table_id')
+        dyn_tblcnt = DynamicFrame.fromDF(df_tblcnt, glueContext, "df_tblcnt")
+        send_to_s3(dyn_tblcnt, 'table_counts')
+        
+        job.commit()
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: "LedgerExportS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub 'arn:aws:s3:::ledger-export-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::ledger-export-${AWS::AccountId}/*'
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub '${LambdaCodeBucket.Arn}/*'
+        - PolicyName: "GlueOutputS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !GetAtt GlueOutputBucket.Arn
+                  - !Sub '${GlueOutputBucket.Arn}/*'
+        - PolicyName: 'GlueQldbAccess'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "qldb:GetDigest"
+                  - "qldb:SendCommand"
+                  - "qldb:PartiQLSelect"
+                Resource:
+                  - !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${LedgerName}'
+                  - !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${LedgerName}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ExtractionTransformationJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: ledger-dmv-migrate
+      Description: 'Extracts revisions from the DMV ledger export and transforms it for use by DMS'
+      Command:
+        Name: glueetl
+        PythonVersion: 3
+        ScriptLocation: !GetAtt PutGlueJobCodeToS3.S3Url
+      GlueVersion: 4.0
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref NumberOfGlueWorkers
+      Role: !GetAtt GlueJobRole.Arn
+      DefaultArguments:
+        '--additional-python-modules': 'pyqldb, amazon.ion'
+        '--ledger_name': !Ref LedgerName
+        '--export_bucket': !Sub 'ledger-export-${AWS::AccountId}'
+        '--export_base_prefix': !Ref ExportBasePrefix
+        '--export_ids': !Ref ExportIds
+        '--s3_output_base_uri': !Sub 's3://${GlueOutputBucket}/dmv/'
+
+  DmsAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: "LedgerMigrationDmsS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !GetAtt GlueOutputBucket.Arn
+                  - !Sub '${GlueOutputBucket.Arn}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "dms.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ReplicationSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      SubnetIds: !Ref ReplicationInstanceSubnets
+      ReplicationSubnetGroupDescription: 'Subnets in which to place DMS replication instance(s)'
+
+  ReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      AllocatedStorage: 50
+      ReplicationInstanceClass: !Ref ReplicationInstanceClass
+      ReplicationInstanceIdentifier: 'ledger-migrator'
+      ReplicationSubnetGroupIdentifier: !Ref ReplicationSubnetGroup
+      VpcSecurityGroupIds: !Ref SecurityGroups
+
+  SourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: 'dmv-export'
+      EndpointType: source
+      EngineName: s3
+      S3Settings:
+        BucketName: !Ref GlueOutputBucket
+        IgnoreHeaderRows: 1
+        ServiceAccessRoleArn: !GetAtt DmsAccessRole.Arn
+        ExternalTableDefinition: |
+          {
+              "TableCount": "8",
+              "Tables": [
+                  {
+                      "TableName": "person",
+                      "TablePath": "dmv/person/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "person_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "first_name",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "100",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "last_name",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "100",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "dob",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "gov_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "gov_id_type",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "address",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "100",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "10"
+                  },
+                  {
+                      "TableName": "drivers_license",
+                      "TablePath": "dmv/drivers_license/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "person_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "license_plate_num",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "license_type",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_from_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_to_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "8"
+                  },
+                  {
+                      "TableName": "vehicle",
+                      "TablePath": "dmv/vehicle/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "vin",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "type",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "year",
+                              "ColumnType": "INT4",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "make",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "model",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "color",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "9"
+                  },
+                  {
+                      "TableName": "vehicle_registration",
+                      "TablePath": "dmv/vehicle_registration/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "vin",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "license_plate_num",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "state",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "10",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "city",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "pending_penalty_amt",
+                              "ColumnType": "NUMERIC",
+                              "ColumnPrecision": "8",
+                              "ColumnScale": "2",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_from_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_to_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "primary_owner",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "secondary_owners",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "200",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "12"
+                  },
+                  {
+                      "TableName": "person_audit_log",
+                      "TablePath": "dmv/person_audit_log/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "person_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "first_name",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "100",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "last_name",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "100",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "dob",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "gov_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "gov_id_type",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "address",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "100",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "operation",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "1",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "transaction_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "12"
+                  },
+                  {
+                      "TableName": "drivers_license_audit_log",
+                      "TablePath": "dmv/drivers_license_audit_log/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "person_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "license_plate_num",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "license_type",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_from_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_to_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "operation",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "1",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "transaction_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "10"
+                  },
+                  {
+                      "TableName": "vehicle_audit_log",
+                      "TablePath": "dmv/vehicle_audit_log/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "vin",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "type",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "year",
+                              "ColumnType": "INT4",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "make",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "model",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "color",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "operation",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "1",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "transaction_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "11"
+                  },
+                  {
+                      "TableName": "vehicle_registration_audit_log",
+                      "TablePath": "dmv/vehicle_registration_audit_log/",
+                      "TableOwner": "dmv",
+                      "TableColumns": [
+                          {
+                              "ColumnName": "doc_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnIsPk": "true"
+                          },
+                          {
+                              "ColumnName": "version",
+                              "ColumnType": "INT4"
+                          },
+                          {
+                              "ColumnName": "vin",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "license_plate_num",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "50",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "state",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "10",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "city",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "pending_penalty_amt",
+                              "ColumnType": "NUMERIC",
+                              "ColumnPrecision": "8",
+                              "ColumnScale": "2",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_from_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "valid_to_dt",
+                              "ColumnType": "DATE",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "primary_owner",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "secondary_owners",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "200",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "ql_audit",
+                              "ColumnType": "CLOB",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "operation",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "1",
+                              "ColumnNullable": "true"
+                          },
+                          {
+                              "ColumnName": "transaction_id",
+                              "ColumnType": "STRING",
+                              "ColumnLength": "25",
+                              "ColumnNullable": "true"
+                          }
+                      ],
+                      "TableColumnsTotal": "14"
+                  }
+              ]
+          }
+
+  TargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: 'dmv-postgres'
+      EndpointType: target
+      EngineName: aurora-postgresql
+      DatabaseName: !Ref TargetDatabaseName
+      Username: !Join ["", ["{{resolve:secretsmanager:", !Ref TargetDatabaseSecretName, ":SecretString:username}}" ]]
+      Password: !Join ["", ["{{resolve:secretsmanager:", !Ref TargetDatabaseSecretName, ":SecretString:password}}" ]]
+      ServerName: !Join ["", ["{{resolve:secretsmanager:", !Ref TargetDatabaseSecretName, ":SecretString:host}}" ]]
+      Port: !Join ["", ["{{resolve:secretsmanager:", !Ref TargetDatabaseSecretName, ":SecretString:port}}" ]]
+
+
+  ReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      MigrationType: full-load
+      ReplicationTaskIdentifier: dmv-full-migration
+      ReplicationInstanceArn: !Ref ReplicationInstance
+      SourceEndpointArn: !Ref SourceEndpoint
+      TargetEndpointArn: !Ref TargetEndpoint
+      ReplicationTaskSettings: |
+        {
+          "Logging": {
+            "EnableLogging": true,
+            "EnableLogContext": true,
+            "LogComponents": [
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "TRANSFORMATION"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "SOURCE_UNLOAD"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "IO"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEBUG",
+                "Id": "TARGET_LOAD"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "PERFORMANCE"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "SOURCE_CAPTURE"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "SORTER"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "REST_SERVER"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "VALIDATOR_EXT"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEBUG",
+                "Id": "TARGET_APPLY"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEBUG",
+                "Id": "TASK_MANAGER"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "TABLES_MANAGER"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "METADATA_MANAGER"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "FILE_FACTORY"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "COMMON"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "ADDONS"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "DATA_STRUCTURE"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "COMMUNICATION"
+              },
+              {
+                "Severity": "LOGGER_SEVERITY_DEFAULT",
+                "Id": "FILE_TRANSFER"
+              }
+            ]
+          },
+          "StreamBufferSettings": {
+            "StreamBufferCount": 3,
+            "CtrlStreamBufferSizeInMB": 5,
+            "StreamBufferSizeInMB": 8
+          },
+          "ErrorBehavior": {
+            "FailOnNoTablesCaptured": true,
+            "ApplyErrorUpdatePolicy": "LOG_ERROR",
+            "FailOnTransactionConsistencyBreached": false,
+            "RecoverableErrorThrottlingMax": 1800,
+            "DataErrorEscalationPolicy": "SUSPEND_TABLE",
+            "ApplyErrorEscalationCount": 0,
+            "RecoverableErrorStopRetryAfterThrottlingMax": true,
+            "RecoverableErrorThrottling": true,
+            "ApplyErrorFailOnTruncationDdl": false,
+            "DataTruncationErrorPolicy": "LOG_ERROR",
+            "ApplyErrorInsertPolicy": "LOG_ERROR",
+            "EventErrorPolicy": "IGNORE",
+            "ApplyErrorEscalationPolicy": "LOG_ERROR",
+            "RecoverableErrorCount": -1,
+            "DataErrorEscalationCount": 0,
+            "TableErrorEscalationPolicy": "STOP_TASK",
+            "RecoverableErrorInterval": 5,
+            "ApplyErrorDeletePolicy": "IGNORE_RECORD",
+            "TableErrorEscalationCount": 0,
+            "FullLoadIgnoreConflicts": true,
+            "DataErrorPolicy": "LOG_ERROR",
+            "TableErrorPolicy": "SUSPEND_TABLE"
+          },
+          "TTSettings": null,
+          "FullLoadSettings": {
+            "CommitRate": 10000,
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8,
+            "TransactionConsistencyTimeout": 600,
+            "CreatePkAfterFullLoad": false,
+            "TargetTablePrepMode": "TRUNCATE_BEFORE_LOAD"
+          },
+          "TargetMetadata": {
+            "ParallelApplyBufferSize": 0,
+            "ParallelApplyQueuesPerThread": 0,
+            "ParallelApplyThreads": 0,
+            "TargetSchema": "",
+            "InlineLobMaxSize": 0,
+            "ParallelLoadQueuesPerThread": 0,
+            "SupportLobs": true,
+            "LobChunkSize": 0,
+            "TaskRecoveryTableEnabled": false,
+            "ParallelLoadThreads": 0,
+            "LobMaxSize": 32,
+            "BatchApplyEnabled": false,
+            "FullLobMode": false,
+            "LimitedSizeLobMode": true,
+            "LoadMaxFileSize": 0,
+            "ParallelLoadBufferSize": 0
+          },
+          "BeforeImageSettings": null,
+          "ControlTablesSettings": {
+            "historyTimeslotInMinutes": 5,
+            "HistoryTimeslotInMinutes": 5,
+            "StatusTableEnabled": false,
+            "SuspendedTablesTableEnabled": false,
+            "HistoryTableEnabled": false,
+            "ControlSchema": "",
+            "FullLoadExceptionTableEnabled": false
+          },
+          "LoopbackPreventionSettings": null,
+          "CharacterSetSettings": null,
+          "FailTaskWhenCleanTaskResourceFailed": false,
+          "ChangeProcessingTuning": {
+            "StatementCacheSize": 50,
+            "CommitTimeout": 1,
+            "BatchApplyPreserveTransaction": true,
+            "BatchApplyTimeoutMin": 1,
+            "BatchSplitSize": 0,
+            "BatchApplyTimeoutMax": 30,
+            "MinTransactionSize": 1000,
+            "MemoryKeepTime": 60,
+            "BatchApplyMemoryLimit": 500,
+            "MemoryLimitTotal": 1024
+          },
+          "ChangeProcessingDdlHandlingPolicy": {
+            "HandleSourceTableDropped": true,
+            "HandleSourceTableTruncated": true,
+            "HandleSourceTableAltered": true
+          },
+          "PostProcessingRules": null
+        }
+      TableMappings: |
+        {
+            "rules": [
+                {
+                    "rule-type": "selection",
+                    "rule-id": "1",
+                    "rule-name": "1",
+                    "object-locator": {
+                        "schema-name": "dmv",
+                        "table-name": "%"
+                    },
+                    "rule-action": "include"
+                }
+            ]
+        }
+
+
+Outputs:
+  GlueOutputBucketName:
+    Description: 'The name of the S3 bucket that the Glue job writes its output to'
+    Value: !Ref GlueOutputBucket
+
+  GlueOutputBucketArn:
+    Description: 'The ARN of the S3 bucket that the Glue job writes its output to'
+    Value: !GetAtt GlueOutputBucket.Arn
