@@ -170,7 +170,7 @@ Deploy the required components for change data replication using AWS CloudFormat
 |---|---|
 |**AuroraClusterArn**|The value of the **AuroraClusterArn** output parameter from the **ledger-migrate-setup** stack.|
 |**AuroraDatabaseName**|The value of the **TargetDatabaseName** output parameter from the **ledger-migrate-setup** stack.|
-|**DatabaseUserSecretArn**|The value of the **MigrateDatabaseUserSecretName** output parameter from the **ledger-migrate-setup** stack.|
+|**DatabaseUserSecretArn**|The value of the **MigrateDatabaseUserSecretARN** output parameter from the **ledger-migrate-setup** stack.|
 |**KinesisShardCount**|1|
 |**LastFullLoadBlock**|Enter the value of “LastBlockNum” taken from the export step function.|
 |**LedgerName**|The value of the **LedgerName** output parameter from the **ledger-migrate-setup** stack.|

@@ -1020,7 +1020,6 @@ Resources:
     Type: AWS::RDS::DBCluster
     Properties:
       DatabaseName: !Ref AuroraDatabaseName
-      DBClusterIdentifier: aurora-ledger
       DBSubnetGroupName: !Ref DataSubnets
       DeletionProtection: False
       EnableCloudwatchLogsExports:
@@ -1032,6 +1031,7 @@ Resources:
       MasterUsername: !Join [ "", [ "{{resolve:secretsmanager:", !Ref DatabasePostgresUserPassword, ":SecretString:username}}" ]]
       MasterUserPassword: !Join [ "", [ "{{resolve:secretsmanager:", !Ref DatabasePostgresUserPassword, ":SecretString:password}}" ]]
       Port: 5432
+      StorageEncrypted: True
       VpcSecurityGroupIds:
         - !GetAtt VPC.DefaultSecurityGroup
         - !GetAtt DatabaseSecurityGroup.GroupId
@@ -1044,6 +1044,7 @@ Resources:
       DBInstanceIdentifier: aurora-ledger1
       Engine: aurora-postgresql
       EnablePerformanceInsights: True
+      PubliclyAccessible: False
 
   PostgresUserSecretAttachment:
     Type: AWS::SecretsManager::SecretTargetAttachment
