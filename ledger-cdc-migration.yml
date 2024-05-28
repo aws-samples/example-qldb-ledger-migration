@@ -304,18 +304,10 @@ Resources:
       CompatibleRuntimes:
         - python3.11
 
-  KmsKey:
-    Type: AWS::KMS::Key
-    Properties:
-      Enabled: True      
-
   KinesisStream:
     Type: AWS::Kinesis::Stream
     Properties:
       ShardCount: !Ref KinesisShardCount
-      StreamEncryption:
-        EncryptionType: KMS
-        KeyId: !GetAtt KmsKey.Arn
 
   QldbServiceRole:
     Type: AWS::IAM::Role
@@ -332,11 +324,6 @@ Resources:
                   - 'kinesis:ListShards'
                 Resource:
                   - !GetAtt KinesisStream.Arn
-              - Effect: Allow
-                Action:
-                  - kms:GenerateDataKey
-                Resource:
-                  - !GetAtt KmsKey.Arn
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -395,10 +382,6 @@ Resources:
                   - 'secretsmanager:GetSecretValue'
                 Resource:
                   - !Ref DatabaseUserSecretArn
-              - Effect: 'Allow'
-                Action: 'kms:Decrypt'
-                Resource:
-                  - !GetAtt KmsKey.Arn
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
