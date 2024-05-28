@@ -102,9 +102,28 @@ Resources:
     DeletionPolicy: Retain
     Properties:
       BucketName: !Sub 'ledger-etl-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
 
   LambdaCodeBucket:
     Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
 
   EmptyS3BucketFunctionRole:
     Type: "AWS::IAM::Role"
@@ -793,6 +812,7 @@ Resources:
     Type: AWS::DMS::ReplicationInstance
     Properties:
       AllocatedStorage: 50
+      PubliclyAccessible: False
       ReplicationInstanceClass: !Ref ReplicationInstanceClass
       ReplicationInstanceIdentifier: 'ledger-migrator'
       ReplicationSubnetGroupIdentifier: !Ref ReplicationSubnetGroup

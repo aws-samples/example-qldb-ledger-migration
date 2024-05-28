@@ -91,6 +91,15 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'ledger-setup-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE              
 
   EmptyS3BucketFunctionRole:
     Type: "AWS::IAM::Role"
@@ -889,7 +898,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: 'rds:DescribeDBInstances'
-                Resource: '*'
+                Resource: 
+                  - !GetAtt WriterInstance.DBInstanceArn
+                  - !GetAtt AuroraCluster.DBClusterArn
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

@@ -57,6 +57,16 @@ Parameters:
 Resources:
   LambdaCodeBucket:
     Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
 
   EmptyS3BucketFunctionRole:
     Type: "AWS::IAM::Role"
@@ -294,11 +304,18 @@ Resources:
       CompatibleRuntimes:
         - python3.11
 
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: True      
+
   KinesisStream:
     Type: AWS::Kinesis::Stream
     Properties:
-      Name: DmvLedgerStream
       ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !GetAtt KmsKey.Arn
 
   QldbServiceRole:
     Type: AWS::IAM::Role
@@ -315,6 +332,11 @@ Resources:
                   - 'kinesis:ListShards'
                 Resource:
                   - !GetAtt KinesisStream.Arn
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource:
+                  - !GetAtt KmsKey.Arn
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -358,7 +380,7 @@ Resources:
                 Action:
                   - 'kinesis:ListStreams'
                 Resource:
-                  - '*'
+                  - !GetAtt KinesisStream.Arn
               - Effect: 'Allow'
                 Action:
                   - 'rds-data:BatchExecuteStatement'
@@ -373,6 +395,10 @@ Resources:
                   - 'secretsmanager:GetSecretValue'
                 Resource:
                   - !Ref DatabaseUserSecretArn
+              - Effect: 'Allow'
+                Action: 'kms:Decrypt'
+                Resource:
+                  - !GetAtt KmsKey.Arn
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
