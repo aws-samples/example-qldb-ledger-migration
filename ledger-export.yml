@@ -22,6 +22,11 @@ Description: >
   running concurrently.  Ledger digests and proof hashes are collected for each of the export jobs and written to
   S3 alongside the exported ledger blocks.
 
+Parameters:
+  LedgerName:
+    Description: "The name of the DMV QLDB ledger"
+    Type: "String"
+    Default: "vehicle-registration"
 
 Resources:
   LambdaCodeBucket:
@@ -339,7 +344,7 @@ Resources:
                   - "qldb:GetBlock"
                   - "qldb:ExportJournalToS3"
                   - "qldb:DescribeJournalS3Export"
-                Resource: "*"
+                Resource: !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${LedgerName}'
               - Effect: "Allow"
                 Action:
                   - "s3:PutObjectAcl"

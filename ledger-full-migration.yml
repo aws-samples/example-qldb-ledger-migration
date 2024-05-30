@@ -53,6 +53,7 @@ Parameters:
   LedgerName:
     Description: "The name of the DMV QLDB ledger"
     Type: "String"
+    Default: "vehicle-registration"
 
   GlueWorkerType:
     Description: 'The worker type specifying capacity for each node running the Glue job'

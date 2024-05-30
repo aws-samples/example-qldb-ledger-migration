@@ -304,10 +304,29 @@ Resources:
       CompatibleRuntimes:
         - python3.11
 
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: True
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: stream-key-1
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: "kms:*"
+            Resource: "*"
+
   KinesisStream:
     Type: AWS::Kinesis::Stream
     Properties:
       ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !GetAtt KmsKey.Arn
 
   QldbServiceRole:
     Type: AWS::IAM::Role
@@ -324,6 +343,11 @@ Resources:
                   - 'kinesis:ListShards'
                 Resource:
                   - !GetAtt KinesisStream.Arn
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource:
+                  - !GetAtt KmsKey.Arn
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -381,7 +405,11 @@ Resources:
                 Action:
                   - 'secretsmanager:GetSecretValue'
                 Resource:
-                  - !Ref DatabaseUserSecretArn
+                  - !Ref DatabaseUserSecretArn              
+              - Effect: 'Allow'
+                Action: 'kms:Decrypt'
+                Resource:
+                  - !GetAtt KmsKey.Arn
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

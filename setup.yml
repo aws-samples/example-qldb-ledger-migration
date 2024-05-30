@@ -386,7 +386,7 @@ Resources:
     Properties:
       AvailabilityZone: !Select [0, Fn::GetAZs: !Ref 'AWS::Region']
       CidrBlock: !Select [0, !Ref PublicSubnetCIDRs]
-      MapPublicIpOnLaunch: "true"
+      MapPublicIpOnLaunch: False
       VpcId: !Ref VPC
       Tags:
         - Key: "Name"
@@ -430,7 +430,7 @@ Resources:
     Properties:
       AvailabilityZone: !GetAtt PublicSubnet1.AvailabilityZone
       CidrBlock: !Select [0, !Ref DatabaseSubnetCIDRs]
-      MapPublicIpOnLaunch: "false"
+      MapPublicIpOnLaunch: False
       VpcId: !Ref VPC
       Tags:
         - Key: "Name"
@@ -450,7 +450,7 @@ Resources:
     Properties:
       AvailabilityZone: !Select [1, Fn::GetAZs: !Ref 'AWS::Region']
       CidrBlock: !Select [1, !Ref PublicSubnetCIDRs]
-      MapPublicIpOnLaunch: "true"
+      MapPublicIpOnLaunch: False
       VpcId: !Ref VPC
       Tags:
         - Key: "Name"
@@ -494,7 +494,7 @@ Resources:
     Properties:
       AvailabilityZone: !GetAtt PublicSubnet2.AvailabilityZone
       CidrBlock: !Select [1, !Ref DatabaseSubnetCIDRs]
-      MapPublicIpOnLaunch: "false"
+      MapPublicIpOnLaunch: False
       VpcId: !Ref VPC
       Tags:
         - Key: "Name"
@@ -514,7 +514,7 @@ Resources:
     Properties:
       AvailabilityZone: !Select [2, Fn::GetAZs: !Ref 'AWS::Region']
       CidrBlock: !Select [2, !Ref PublicSubnetCIDRs]
-      MapPublicIpOnLaunch: "true"
+      MapPublicIpOnLaunch: False
       VpcId: !Ref VPC
       Tags:
         - Key: "Name"
@@ -558,7 +558,7 @@ Resources:
     Properties:
       AvailabilityZone: !GetAtt PublicSubnet3.AvailabilityZone
       CidrBlock: !Select [2, !Ref DatabaseSubnetCIDRs]
-      MapPublicIpOnLaunch: "false"
+      MapPublicIpOnLaunch: False
       VpcId: !Ref VPC
       Tags:
         - Key: "Name"
@@ -887,7 +887,6 @@ Resources:
   DatabaseAvailableCheckFunctionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::StackName}-DatabaseAvailabilityCheckAccess'
       Description: 'Permissions for the database availability check function'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
@@ -1004,18 +1003,19 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: 'Grants access to the PostgreSQL port on the host'
-      GroupName: !Sub "${VPCName} Postgres Access"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
           CidrIp: !GetAtt VPC.CidrBlock
+          Description: 'Allow access to PostgreSQL port from hosts in this VPC'
       SecurityGroupEgress:
         - IpProtocol: -1
           FromPort: -1
           ToPort: -1
           CidrIp: 0.0.0.0/0
+          Description: 'Allow all egress'
 
   DataSubnets:
     Type: AWS::RDS::DBSubnetGroup
@@ -1052,7 +1052,6 @@ Resources:
     Properties:
       DBClusterIdentifier: !Ref AuroraCluster
       DBInstanceClass: !Ref AuroraDBInstanceClass
-      DBInstanceIdentifier: aurora-ledger1
       Engine: aurora-postgresql
       EnablePerformanceInsights: True
       PubliclyAccessible: False

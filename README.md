@@ -60,7 +60,7 @@ The next step in the migration is to export data from the source ledger into an 
 
 We use an AWS Step Function to perform the export.  The step function accepts the desired number of concurrent exports as a parameter.  It fetches a ledger digest to obtain the last block number in the journal and uses that to divide the ledger into equal parts, dividing work evenly across exports.  The step function starts the export jobs and loops until they are all complete.
 
-Create a new CloudFormation stack called "ledger-export" using the ledger-export.yml file from the project files.  This stack does not have any parameters.  Launch the stack and wait for it to complete before proceeding.
+Create a new CloudFormation stack called "ledger-export" using the ledger-export.yml file from the project files.  This stack has a single parameter called `LedgerName` that can be left at its default value.  Launch the stack and wait for it to complete before proceeding.
 
 When the stack is in the CREATE_COMPLETE stage, navigate to the AWS Step Functions console.  In the list of state machines, click the “LedgerExporter” state machine.
 
